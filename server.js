@@ -4347,9 +4347,30 @@ async function handleRequest(req, res) {
 
   const billingEventMatch = path.match(/^\/api\/billing\/events\/(\d+)$/);
   if (billingEventMatch && req.method === "GET") {
-    const event = getAiBillingEvent(Number(billingEventMatch[1]));
+    let event = getAiBillingEvent(Number(billingEventMatch[1]));
     if (!event) return sendJson(res, 404, { error: "Cobranca nao encontrada." });
-    return sendJson(res, 200, publicBillingFromEvent(event));
+
+    let billing = publicBillingFromEvent(event);
+    if (!billing.paid && event.provider === "mercado_pago" && event.provider_reference) {
+      try {
+        await refreshMercadoPagoBillingEvent(event);
+        event = getAiBillingEvent(event.id) || event;
+        billing = publicBillingFromEvent(event);
+      } catch (error) {
+        console.error("Falha ao atualizar status Mercado Pago no polling:", error.message);
+      }
+    }
+
+    if (billing.paid && !billing.ai_processing && !billing.ai_processed && !billing.ai_error) {
+      processPaidAiBillingEvent(event.id, "billing_status_poll").catch((error) => {
+        markBillingAiProcessingError(event.id, error);
+        console.error("Falha ao iniciar IA pelo polling de cobranca:", error.message);
+      });
+      event = getAiBillingEvent(event.id) || event;
+      billing = publicBillingFromEvent(event);
+    }
+
+    return sendJson(res, 200, billing);
   }
 
   if (req.method === "POST" && path === "/api/billing/toggle") {
