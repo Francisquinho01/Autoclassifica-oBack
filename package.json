@@ -1,0 +1,14 @@
+{
+  "name": "aikkie-autoclass-back",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "node --watch server.js",
+    "start": "node server.js",
+    "check": "node --check server.js"
+  },
+  "dependencies": {
+    "xlsx": "^0.18.5"
+  }
+}
