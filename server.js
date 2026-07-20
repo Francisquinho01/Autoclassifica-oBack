@@ -3132,18 +3132,43 @@ function getOfficialNcmsFromWebEvidence(webEvidence) {
     .sort((a, b) => b.count - a.count || a.codigo.localeCompare(b.codigo));
 }
 
+function getNcmsFromWebEvidence(webEvidence) {
+  if (webEvidence?.status !== "ok" || !Array.isArray(webEvidence.items)) return [];
+  const counts = new Map();
+  for (const item of webEvidence.items) {
+    const text = `${item.title || ""} ${item.snippet || ""} ${item.url || ""}`;
+    for (const code of extractNcmCodesFromText(text)) {
+      counts.set(code, (counts.get(code) || 0) + 1);
+    }
+  }
+  return [...counts.entries()]
+    .map(([codigo, count]) => ({ codigo, count, row: getOfficialNcmRow(codigo) || null }))
+    .sort((a, b) => Number(Boolean(b.row)) - Number(Boolean(a.row)) || b.count - a.count || a.codigo.localeCompare(b.codigo));
+}
+
 function pickWebEvidenceNcm(webEvidence, preferredCode) {
   const officialCodes = getOfficialNcmsFromWebEvidence(webEvidence);
   const cleanPreferred = normalizeNcmCode(preferredCode);
   const preferred = officialCodes.find((item) => item.codigo === cleanPreferred);
   if (preferred) return preferred;
-  return officialCodes.length === 1 ? officialCodes[0] : null;
+  if (officialCodes.length === 1) return officialCodes[0];
+
+  const allCodes = getNcmsFromWebEvidence(webEvidence);
+  const anyPreferred = allCodes.find((item) => item.codigo === cleanPreferred);
+  if (anyPreferred) return anyPreferred;
+  return allCodes.length === 1 ? allCodes[0] : null;
 }
 
 function aiSourcesSupportNcm(sources = [], code) {
   const cleanCode = normalizeNcmCode(code);
   if (!cleanCode) return false;
   return sources.some((source) => normalizeNcmCode(source?.code) === cleanCode);
+}
+
+function aiSourceDescription(sources = [], code) {
+  const cleanCode = normalizeNcmCode(code);
+  const source = sources.find((item) => normalizeNcmCode(item?.code) === cleanCode && item?.description);
+  return source?.description ? String(source.description) : null;
 }
 
 function buildAiWarnings(ai, context, code) {
@@ -3167,10 +3192,10 @@ function officialCodeFromCandidate(candidate) {
 
 function pickFallbackNcmCode(context, rawText = "") {
   for (const code of extractNcmCodesFromText(rawText)) {
-    if (getOfficialNcmRow(code)) return { code, source: "openai_text" };
+    return { code, source: "openai_text" };
   }
 
-  const webCode = pickWebEvidenceNcm(context.web_evidence, null) || getOfficialNcmsFromWebEvidence(context.web_evidence)[0];
+  const webCode = pickWebEvidenceNcm(context.web_evidence, null) || getNcmsFromWebEvidence(context.web_evidence)[0];
   if (webCode?.codigo) return { code: webCode.codigo, source: "web_evidence" };
 
   const localBest = officialCodeFromCandidate(context.local_best);
@@ -3187,7 +3212,7 @@ function buildFallbackAiNcmResult(context, rawText = "", parseError = null) {
   const picked = pickFallbackNcmCode(context, rawText);
   const code = picked.code;
   const row = getOfficialNcmRow(code);
-  const hasNcm = Boolean(row);
+  const hasNcm = code && code !== "00000000";
   return {
     ncm: hasNcm ? code : "00000000",
     confidence: hasNcm ? OPENAI_NCM_APPLY_THRESHOLD : 0.2,
@@ -3207,7 +3232,7 @@ function buildFallbackAiNcmResult(context, rawText = "", parseError = null) {
           {
             type: picked.source,
             code,
-            description: row.descricao
+            description: row?.descricao || "NCM encontrado em evidencia externa"
           }
         ]
       : []
@@ -3218,27 +3243,26 @@ function normalizeAiNcmResult(ai, context) {
   const aiNcm = normalizeNcmCode(ai?.ncm);
   const webEvidenceNcm = pickWebEvidenceNcm(context.web_evidence, aiNcm);
   const cleanNcm = webEvidenceNcm?.codigo || aiNcm;
+  const validNcm = cleanNcm && cleanNcm.length === 8 && cleanNcm !== "00000000";
   const candidateCodes = new Set((context.candidates || []).map((item) => normalizeNcmCode(item.codigo)));
   const currentCode = normalizeNcmCode(context.current?.ncm);
   const official = getOfficialNcmRow(cleanNcm);
   const fromCandidates = candidateCodes.has(cleanNcm) || (cleanNcm && cleanNcm === currentCode && Boolean(official));
   const fromWebEvidence = webEvidenceSupportsNcm(context.web_evidence, cleanNcm);
-  const fromAiSources = Boolean(official) && aiSourcesSupportNcm(ai?.sources || [], cleanNcm);
+  const fromAiSources = aiSourcesSupportNcm(ai?.sources || [], cleanNcm);
   const acceptedByResearch = fromCandidates || fromWebEvidence || fromAiSources;
-  const researchedNcm =
-    cleanNcm &&
-    cleanNcm !== "00000000" &&
-    Boolean(official) &&
-    acceptedByResearch;
+  const researchedNcm = validNcm && acceptedByResearch;
   const confidence = researchedNcm
     ? Math.max(clampConfidence(ai?.confidence), OPENAI_NCM_APPLY_THRESHOLD)
     : clampConfidence(ai?.confidence);
   const safeToApply = Boolean(researchedNcm);
   const warnings = buildAiWarnings(ai, context, cleanNcm);
+  const sourceDescription = aiSourceDescription(ai?.sources || [], cleanNcm);
+  const description = official?.descricao || sourceDescription || webEvidenceNcm?.row?.descricao || "NCM aplicado por evidencia da IA/web";
   return {
     ncm: cleanNcm || "00000000",
     formatted: formatNcm(cleanNcm),
-    descricao: official?.descricao || null,
+    descricao: description,
     confidence,
     status: safeToApply ? "apply" : ai?.status || "uncertain",
     should_apply: safeToApply,
