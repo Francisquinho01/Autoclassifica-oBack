@@ -4168,6 +4168,7 @@ async function syncNcmOfficial(actor = "sistema") {
 }
 
 const MERCADO_PAGO_WEBHOOK_PATHS = new Set([
+  "/",
   "/api/billing/mercado-pago/webhook",
   "/api/mercado-pago/webhook",
   "/api/webhooks/mercado-pago",
@@ -4182,6 +4183,15 @@ async function handleRequest(req, res) {
   if (req.method === "OPTIONS") return sendOptions(res);
   const url = new URL(req.url || "/", `http://${req.headers.host || "localhost"}`);
   const path = url.pathname;
+
+  if (req.method === "GET" && path === "/") {
+    return sendJson(res, 200, {
+      ok: true,
+      service: "Aikkie AutoClass Fiscal",
+      health: "/health",
+      mercado_pago_webhook: "/webhooks/mercado-pago"
+    });
+  }
 
   if (req.method === "GET" && path === "/health") {
     return sendJson(res, 200, { ok: true, service: "Aikkie AutoClass Fiscal", db: DB_PATH });
