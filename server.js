@@ -42,12 +42,17 @@ const OPENAI_NCM_API_URL = process.env.OPENAI_NCM_API_URL || "https://api.openai
 const OPENAI_NCM_APPLY_THRESHOLD = Math.min(Math.max(Number(process.env.OPENAI_NCM_APPLY_THRESHOLD || 0.82), 0.5), 0.99);
 const OPENAI_NCM_MAX_CANDIDATES = Math.min(Math.max(Number(process.env.OPENAI_NCM_MAX_CANDIDATES || 8), 3), 15);
 const OPENAI_NCM_TIMEOUT_MS = Math.min(Math.max(Number(process.env.OPENAI_NCM_TIMEOUT_MS || 30000), 8000), 90000);
+const OPENAI_NCM_MAX_OUTPUT_TOKENS = Math.min(Math.max(Number(process.env.OPENAI_NCM_MAX_OUTPUT_TOKENS || 2500), 600), 8000);
 const OPENAI_NCM_WEB_SEARCH_ENABLED = String(process.env.OPENAI_NCM_WEB_SEARCH_ENABLED || "true").toLowerCase() !== "false";
 const MERCADO_PAGO_ACCESS_TOKEN = process.env.MERCADO_PAGO_ACCESS_TOKEN || "";
 const AI_BILLING_PRICE_CENTS = Math.min(Math.max(Number(process.env.AI_BILLING_PRICE_CENTS || 10), 1), 100000);
 const AI_BILLING_DEFAULT_ENABLED = String(process.env.AI_BILLING_DEFAULT_ENABLED || "false").toLowerCase() === "true";
 const AI_BILLING_TRUST_PAYMENT_UPDATED_WEBHOOK =
   String(process.env.AI_BILLING_TRUST_PAYMENT_UPDATED_WEBHOOK || "true").toLowerCase() !== "false";
+const AI_BILLING_PROCESSING_LOCK_MS = Math.min(
+  Math.max(Number(process.env.AI_BILLING_PROCESSING_LOCK_MS || 30 * 60 * 1000), 5 * 60 * 1000),
+  4 * 60 * 60 * 1000
+);
 const MERCADO_PAGO_API_URL = process.env.MERCADO_PAGO_API_URL || "https://api.mercadopago.com";
 const AI_BILLING_DEFAULT_PAYER_EMAIL = "narutoeterno136@gmail.com";
 
@@ -1925,6 +1930,7 @@ function aiNcmConfig() {
     model: OPENAI_NCM_MODEL,
     apply_threshold: OPENAI_NCM_APPLY_THRESHOLD,
     max_candidates: OPENAI_NCM_MAX_CANDIDATES,
+    max_output_tokens: OPENAI_NCM_MAX_OUTPUT_TOKENS,
     api_url: OPENAI_NCM_API_URL.replace(/\/v1\/responses.*/, "/v1/responses"),
     web_search_enabled: OPENAI_NCM_WEB_SEARCH_ENABLED,
     key_hint: OPENAI_API_KEY ? `${OPENAI_API_KEY.slice(0, 7)}...${OPENAI_API_KEY.slice(-4)}` : null,
@@ -1962,6 +1968,7 @@ function moneyFromCents(cents) {
 
 function aiBillingConfig() {
   const enabled = billingEnabled();
+  const activeProcessing = getActiveAiProcessingEvent();
   return {
     enabled,
     mode: enabled ? "mercado_pago_pix_qr" : "test_free",
@@ -1970,6 +1977,8 @@ function aiBillingConfig() {
     currency: "BRL",
     mercado_pago_configured: Boolean(MERCADO_PAGO_ACCESS_TOKEN),
     mercado_pago_token_hint: MERCADO_PAGO_ACCESS_TOKEN ? `${MERCADO_PAGO_ACCESS_TOKEN.slice(0, 8)}...${MERCADO_PAGO_ACCESS_TOKEN.slice(-4)}` : null,
+    processing_locked: Boolean(activeProcessing),
+    active_processing: activeProcessing ? publicBillingFromEvent(activeProcessing) : null,
     note: enabled
       ? "Cobrança ligada: cada uso da IA gera uma cobrança Mercado Pago."
       : "Cobrança desligada: modo teste, nenhum uso da IA gera cobrança."
@@ -2070,6 +2079,7 @@ async function prepareAiBilling({ classificationId = null, quantity = 1, actor =
       message: "Cobrança desligada para teste."
     };
   }
+  assertAiProcessingUnlocked();
 
   const insert = db.prepare(
     `
@@ -2228,6 +2238,35 @@ function publicBillingFromEvent(event, overrides = {}) {
           ? "Pagamento confirmado. IA liberada."
           : "Pagamento ainda nao confirmado."
   };
+}
+
+function isAiBillingProcessingEvent(event) {
+  const metadata = event?.metadata || {};
+  if (!event || metadata.ai_processed_at || metadata.ai_processing_error) return false;
+  if (event.status !== "processing_ai" && !metadata.ai_processing_started_at) return false;
+  const startedAt = metadata.ai_processing_started_at ? Date.parse(metadata.ai_processing_started_at) : 0;
+  if (!startedAt) return event.status === "processing_ai";
+  return Date.now() - startedAt < AI_BILLING_PROCESSING_LOCK_MS;
+}
+
+function getActiveAiProcessingEvent() {
+  const rows = db
+    .prepare("SELECT * FROM ai_billing_events WHERE status = 'processing_ai' ORDER BY updated_at DESC LIMIT 10")
+    .all();
+  for (const row of rows) {
+    const event = rowToAiBillingEvent(row);
+    if (isAiBillingProcessingEvent(event)) return event;
+  }
+  return null;
+}
+
+function assertAiProcessingUnlocked(allowedEventId = null) {
+  const active = getActiveAiProcessingEvent();
+  if (!active || Number(active.id) === Number(allowedEventId || 0)) return;
+  const error = new Error("A IA esta classificando os produtos agora. Aguarde finalizar antes de alterar a tabela ou gerar outro pagamento.");
+  error.status = 409;
+  error.active_billing = publicBillingFromEvent(active);
+  throw error;
 }
 
 async function refreshMercadoPagoBillingEvent(event) {
@@ -2881,6 +2920,14 @@ function collectOpenAiWebEvidence(payload) {
       output.results.forEach(pushItem);
     }
     for (const content of output.content || []) {
+      const contentText = content.text || content.output_text || "";
+      if (contentText) {
+        pushItem({
+          title: "Resumo da pesquisa web OpenAI",
+          url: "",
+          snippet: contentText
+        });
+      }
       for (const annotation of content.annotations || []) {
         if (annotation.type === "url_citation") {
           const citation = annotation.url_citation || annotation;
@@ -2998,7 +3045,7 @@ async function callOpenAiNcm(context) {
         ]
       }
     ],
-    max_output_tokens: 900,
+    max_output_tokens: OPENAI_NCM_MAX_OUTPUT_TOKENS,
     text: {
       format: {
         type: "json_schema",
@@ -3029,17 +3076,13 @@ async function callOpenAiNcm(context) {
     }
     const outputText = extractOpenAiOutputText(payload);
     const parsed = parseOpenAiJsonOutput(outputText);
-    if (!parsed) {
-      const error = new Error("A OpenAI respondeu sem JSON valido para o NCM.");
-      error.status = 502;
-      throw error;
-    }
     return {
       response_id: payload.id || null,
       model: payload.model || OPENAI_NCM_MODEL,
       usage: payload.usage || null,
       raw_text: outputText,
-      parsed
+      parsed,
+      parse_error: parsed ? null : "A OpenAI respondeu sem JSON valido para o NCM."
     };
   } finally {
     clearTimeout(timeout);
@@ -3117,6 +3160,60 @@ function buildAiWarnings(ai, context, code) {
   return warnings.slice(0, 6);
 }
 
+function officialCodeFromCandidate(candidate) {
+  const code = normalizeNcmCode(candidate?.codigo);
+  return code && code !== "00000000" && getOfficialNcmRow(code) ? code : null;
+}
+
+function pickFallbackNcmCode(context, rawText = "") {
+  for (const code of extractNcmCodesFromText(rawText)) {
+    if (getOfficialNcmRow(code)) return { code, source: "openai_text" };
+  }
+
+  const webCode = pickWebEvidenceNcm(context.web_evidence, null) || getOfficialNcmsFromWebEvidence(context.web_evidence)[0];
+  if (webCode?.codigo) return { code: webCode.codigo, source: "web_evidence" };
+
+  const localBest = officialCodeFromCandidate(context.local_best);
+  if (localBest) return { code: localBest, source: "local_best" };
+
+  const candidate = (context.candidates || []).find((item) => officialCodeFromCandidate(item));
+  const candidateCode = officialCodeFromCandidate(candidate);
+  if (candidateCode) return { code: candidateCode, source: "candidate" };
+
+  return { code: "00000000", source: "none" };
+}
+
+function buildFallbackAiNcmResult(context, rawText = "", parseError = null) {
+  const picked = pickFallbackNcmCode(context, rawText);
+  const code = picked.code;
+  const row = getOfficialNcmRow(code);
+  const hasNcm = Boolean(row);
+  return {
+    ncm: hasNcm ? code : "00000000",
+    confidence: hasNcm ? OPENAI_NCM_APPLY_THRESHOLD : 0.2,
+    status: hasNcm ? "apply" : "uncertain",
+    should_apply: hasNcm,
+    needs_review: !hasNcm,
+    product_category: context.product?.descricao || "",
+    reason: hasNcm
+      ? `OpenAI nao retornou JSON valido; NCM aplicado por fallback usando ${picked.source}.`
+      : `OpenAI nao retornou JSON valido e nenhum NCM oficial seguro foi encontrado. ${parseError || ""}`.trim(),
+    warnings: [
+      parseError || "OpenAI respondeu fora do JSON esperado.",
+      hasNcm ? "Resultado aplicado por fallback tecnico; contador deve conferir a classificacao." : "Revisar manualmente."
+    ],
+    sources: hasNcm
+      ? [
+          {
+            type: picked.source,
+            code,
+            description: row.descricao
+          }
+        ]
+      : []
+  };
+}
+
 function normalizeAiNcmResult(ai, context) {
   const aiNcm = normalizeNcmCode(ai?.ncm);
   const webEvidenceNcm = pickWebEvidenceNcm(context.web_evidence, aiNcm);
@@ -3168,13 +3265,15 @@ async function buildAiNcmSuggestion(classification, options = {}) {
   const openAiWebEvidence = await callOpenAiNcmWebSearch(context);
   const enrichedContext = mergeOpenAiWebEvidence(context, openAiWebEvidence);
   const response = await callOpenAiNcm(enrichedContext);
-  const result = normalizeAiNcmResult(response.parsed, enrichedContext);
+  const parsed = response.parsed || buildFallbackAiNcmResult(enrichedContext, response.raw_text, response.parse_error);
+  const result = normalizeAiNcmResult(parsed, enrichedContext);
   return {
     checked_at: now(),
     provider: "openai",
     model: response.model,
     response_id: response.response_id,
     usage: response.usage,
+    parse_error: response.parse_error,
     context: enrichedContext,
     result,
     billing: options.billing || null,
@@ -4392,6 +4491,7 @@ async function handleRequest(req, res) {
 
   if (req.method === "PUT" && path === "/api/company") {
     const payload = JSON.parse(decodeText(await readBody(req)) || "{}");
+    assertAiProcessingUnlocked();
     return sendJson(res, 200, upsertCompany(payload));
   }
 
@@ -4477,39 +4577,46 @@ async function handleRequest(req, res) {
   if (req.method === "POST" && path === "/api/classifications/clear") {
     const payload = JSON.parse(decodeText(await readBody(req)) || "{}");
     assertResetPassword(payload);
+    assertAiProcessingUnlocked();
     return sendJson(res, 200, clearReviewTable(payload.actor || "contador"));
   }
 
   if (req.method === "POST" && path === "/api/classifications/reclassify") {
     const payload = JSON.parse(decodeText(await readBody(req)) || "{}");
+    assertAiProcessingUnlocked();
     return sendJson(res, 200, reclassifyReviewTable(payload.actor || "contador"));
   }
 
   if (req.method === "POST" && path === "/api/classifications/ncm-check") {
     const payload = JSON.parse(decodeText(await readBody(req)) || "{}");
+    assertAiProcessingUnlocked();
     return sendJson(res, 200, await checkReviewTableNcm(payload, payload.actor || "contador"));
   }
 
   if (req.method === "POST" && path === "/api/classifications/ai-ncm") {
     const payload = JSON.parse(decodeText(await readBody(req)) || "{}");
+    assertAiProcessingUnlocked(payload.billing_event_id || payload.billingEventId);
     return sendJson(res, 200, await checkReviewTableAiNcm(payload, payload.actor || "contador"));
   }
 
   if (req.method === "POST" && path === "/api/training/clear") {
     const payload = JSON.parse(decodeText(await readBody(req)) || "{}");
     assertResetPassword(payload);
+    assertAiProcessingUnlocked();
     return sendJson(res, 200, clearTrainingRules(payload.actor || "contador", false));
   }
 
   if (req.method === "POST" && path === "/api/training/clear-invalid") {
     const payload = JSON.parse(decodeText(await readBody(req)) || "{}");
     assertResetPassword(payload);
+    assertAiProcessingUnlocked();
     return sendJson(res, 200, clearTrainingRules(payload.actor || "contador", true));
   }
 
   const classificationMatch = path.match(/^\/api\/classifications\/(\d+)$/);
   if (classificationMatch && req.method === "PATCH") {
     const payload = JSON.parse(decodeText(await readBody(req)) || "{}");
+    assertAiProcessingUnlocked();
     const updated = updateClassification(Number(classificationMatch[1]), payload, payload.actor || "contador");
     if (!updated) return sendJson(res, 404, { error: "Classificacao nao encontrada." });
     return sendJson(res, 200, updated);
@@ -4518,6 +4625,7 @@ async function handleRequest(req, res) {
   const reclassifyMatch = path.match(/^\/api\/classifications\/(\d+)\/reclassify$/);
   if (reclassifyMatch && req.method === "POST") {
     const payload = JSON.parse(decodeText(await readBody(req)) || "{}");
+    assertAiProcessingUnlocked();
     const updated = reclassifyClassification(Number(reclassifyMatch[1]), payload.actor || "contador");
     if (!updated) return sendJson(res, 404, { error: "Classificacao nao encontrada." });
     return sendJson(res, 200, updated);
@@ -4526,6 +4634,7 @@ async function handleRequest(req, res) {
   const ncmCheckMatch = path.match(/^\/api\/classifications\/(\d+)\/ncm-check$/);
   if (ncmCheckMatch && req.method === "POST") {
     const payload = JSON.parse(decodeText(await readBody(req)) || "{}");
+    assertAiProcessingUnlocked();
     const updated = await checkClassificationNcm(Number(ncmCheckMatch[1]), payload, payload.actor || "contador");
     if (!updated) return sendJson(res, 404, { error: "Classificacao nao encontrada." });
     return sendJson(res, 200, updated);
@@ -4534,6 +4643,7 @@ async function handleRequest(req, res) {
   const aiNcmMatch = path.match(/^\/api\/classifications\/(\d+)\/ai-ncm$/);
   if (aiNcmMatch && req.method === "POST") {
     const payload = JSON.parse(decodeText(await readBody(req)) || "{}");
+    assertAiProcessingUnlocked(payload.billing_event_id || payload.billingEventId);
     const updated = await checkClassificationAiNcm(Number(aiNcmMatch[1]), payload, payload.actor || "contador");
     if (!updated) return sendJson(res, 404, { error: "Classificacao nao encontrada." });
     return sendJson(res, 200, updated);
@@ -4542,6 +4652,7 @@ async function handleRequest(req, res) {
   const refineMatch = path.match(/^\/api\/classifications\/(\d+)\/refine$/);
   if (refineMatch && req.method === "POST") {
     const payload = JSON.parse(decodeText(await readBody(req)) || "{}");
+    assertAiProcessingUnlocked();
     const updated = refineClassificationDescription(
       Number(refineMatch[1]),
       payload.descricao || payload.descricao_original,
@@ -4554,6 +4665,7 @@ async function handleRequest(req, res) {
   const approveMatch = path.match(/^\/api\/classifications\/(\d+)\/approve$/);
   if (approveMatch && req.method === "POST") {
     const payload = JSON.parse(decodeText(await readBody(req)) || "{}");
+    assertAiProcessingUnlocked();
     const approved = approveClassification(Number(approveMatch[1]), payload.actor || "contador");
     if (!approved) return sendJson(res, 404, { error: "Classificacao nao encontrada." });
     return sendJson(res, 200, approved);
@@ -4561,6 +4673,7 @@ async function handleRequest(req, res) {
 
   if (req.method === "POST" && path === "/api/products/manual") {
     const payload = JSON.parse(decodeText(await readBody(req)) || "{}");
+    assertAiProcessingUnlocked();
     const result = importProducts({
       products: [payload],
       filename: "cadastro-manual",
@@ -4572,6 +4685,7 @@ async function handleRequest(req, res) {
   }
 
   if (req.method === "POST" && path === "/api/imports") {
+    assertAiProcessingUnlocked();
     const contentType = req.headers["content-type"] || "";
     const body = await readBody(req);
     if (contentType.includes("multipart/form-data")) {
@@ -4611,6 +4725,7 @@ async function handleRequest(req, res) {
   }
 
   if (req.method === "GET" && path === "/api/export/classifications.csv") {
+    assertAiProcessingUnlocked();
     const csv = buildCsvExport();
     const filename = exportFilename("csv");
     sendText(res, 200, csv, "text/csv; charset=utf-8", filename);
@@ -4619,6 +4734,7 @@ async function handleRequest(req, res) {
   }
 
   if (req.method === "GET" && path === "/api/export/classifications.xlsx") {
+    assertAiProcessingUnlocked();
     const buffer = await buildXlsxExport();
     return sendBuffer(
       res,
