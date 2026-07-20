@@ -2366,6 +2366,10 @@ async function resolveAiBillingForUse({ classificationId = null, quantity = 1, a
       error.status = 409;
       throw error;
     }
+    const paymentStatus = event.metadata?.payment?.payment_status;
+    if (options.skip_payment_refresh && (paymentStatus === "approved" || event.status === "paid" || event.status === "processing_ai")) {
+      return publicBillingFromEvent(event);
+    }
     return await refreshMercadoPagoBillingEvent(event);
   }
 
@@ -3441,6 +3445,7 @@ async function processPaidAiBillingEvent(eventId, actor = "mercado_pago_webhook"
       billing_event_id: current.id,
       apply_suggestion: true,
       use_web: true,
+      skip_payment_refresh: true,
       limit: Math.min(Math.max(Number(current.quantity || 1), 1), 500)
     };
     const result =
