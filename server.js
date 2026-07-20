@@ -46,6 +46,8 @@ const OPENAI_NCM_WEB_SEARCH_ENABLED = String(process.env.OPENAI_NCM_WEB_SEARCH_E
 const MERCADO_PAGO_ACCESS_TOKEN = process.env.MERCADO_PAGO_ACCESS_TOKEN || "";
 const AI_BILLING_PRICE_CENTS = Math.min(Math.max(Number(process.env.AI_BILLING_PRICE_CENTS || 10), 1), 100000);
 const AI_BILLING_DEFAULT_ENABLED = String(process.env.AI_BILLING_DEFAULT_ENABLED || "false").toLowerCase() === "true";
+const AI_BILLING_TRUST_PAYMENT_UPDATED_WEBHOOK =
+  String(process.env.AI_BILLING_TRUST_PAYMENT_UPDATED_WEBHOOK || "true").toLowerCase() !== "false";
 const MERCADO_PAGO_API_URL = process.env.MERCADO_PAGO_API_URL || "https://api.mercadopago.com";
 const AI_BILLING_DEFAULT_PAYER_EMAIL = "narutoeterno136@gmail.com";
 
@@ -3461,6 +3463,12 @@ async function processPaidAiBillingEvent(eventId, actor = "mercado_pago_webhook"
   }
 }
 
+function shouldStartAiFromBillingStatus(event, billing) {
+  if (!billing?.paid || billing.ai_processing || billing.ai_processed) return false;
+  if (!billing.ai_error) return true;
+  return normalizeText(billing.ai_error).includes("falha ao consultar mercado pago");
+}
+
 function extractMercadoPagoPaymentId(body = {}, query = {}) {
   return String(
     body?.data?.id ||
@@ -3476,6 +3484,33 @@ function extractMercadoPagoPaymentId(body = {}, query = {}) {
 function isMercadoPagoPaymentWebhook(body = {}, query = {}) {
   const topic = String(body?.type || body?.action || query.type || query.topic || "").toLowerCase();
   return !topic || topic.includes("payment");
+}
+
+function isMercadoPagoPaymentUpdated(body = {}) {
+  return String(body?.action || "").toLowerCase() === "payment.updated";
+}
+
+function trustedMercadoPagoWebhookPayment(paymentId, event, fetchError) {
+  const payment = event?.metadata?.payment || {};
+  return {
+    id: paymentId,
+    status: "approved",
+    status_detail: "trusted_payment_updated_webhook",
+    external_reference: payment.external_reference || null,
+    point_of_interaction: {
+      transaction_data: {
+        qr_code_base64: payment.qr_code_base64 || null,
+        qr_code: payment.qr_code || null,
+        ticket_url: payment.ticket_url || event?.checkout_url || null
+      }
+    },
+    metadata: {
+      ...(event?.metadata || {}),
+      billing_event_id: event?.id || null,
+      trusted_webhook_without_fetch: true,
+      mercado_pago_fetch_error: fetchError?.message || null
+    }
+  };
 }
 
 function logMercadoPagoWebhook(body = {}, payment = null, result = {}) {
@@ -3520,8 +3555,42 @@ async function handleMercadoPagoBillingWebhook(body = {}, query = {}) {
     return result;
   }
 
-  const payment = await fetchMercadoPagoPaymentById(paymentId);
-  const event = getAiBillingEventFromPaymentPayload(payment);
+  const eventFromNotification = getAiBillingEventByPaymentId(paymentId);
+  let payment;
+  try {
+    payment = await fetchMercadoPagoPaymentById(paymentId);
+  } catch (error) {
+    if (AI_BILLING_TRUST_PAYMENT_UPDATED_WEBHOOK && eventFromNotification && isMercadoPagoPaymentUpdated(body)) {
+      payment = trustedMercadoPagoWebhookPayment(paymentId, eventFromNotification, error);
+      const updatedEvent = updateBillingEventWithPaymentPayload(eventFromNotification, payment);
+      const result = {
+        received: true,
+        event_id: updatedEvent.id,
+        payment_id: paymentId,
+        status: payment.status,
+        ai_processing: true,
+        trusted_webhook_without_fetch: true,
+        mercado_pago_fetch_error: error.message
+      };
+      processPaidAiBillingEvent(updatedEvent.id, "mercado_pago_webhook_trusted").catch((processingError) => {
+        markBillingAiProcessingError(updatedEvent.id, processingError);
+        console.error("Falha ao iniciar IA pelo webhook Mercado Pago confiavel:", processingError.message);
+      });
+      logMercadoPagoWebhook(body, payment, result);
+      return result;
+    }
+    const result = {
+      received: true,
+      ignored: true,
+      reason: "mercado_pago_fetch_failed",
+      payment_id: paymentId,
+      error: error.message
+    };
+    logMercadoPagoWebhook(body, null, result);
+    return result;
+  }
+
+  const event = getAiBillingEventFromPaymentPayload(payment) || eventFromNotification;
   if (!event) {
     const result = {
       received: true,
@@ -4356,17 +4425,7 @@ async function handleRequest(req, res) {
     if (!event) return sendJson(res, 404, { error: "Cobranca nao encontrada." });
 
     let billing = publicBillingFromEvent(event);
-    if (!billing.paid && event.provider === "mercado_pago" && event.provider_reference) {
-      try {
-        await refreshMercadoPagoBillingEvent(event);
-        event = getAiBillingEvent(event.id) || event;
-        billing = publicBillingFromEvent(event);
-      } catch (error) {
-        console.error("Falha ao atualizar status Mercado Pago no polling:", error.message);
-      }
-    }
-
-    if (billing.paid && !billing.ai_processing && !billing.ai_processed && !billing.ai_error) {
+    if (shouldStartAiFromBillingStatus(event, billing)) {
       processPaidAiBillingEvent(event.id, "billing_status_poll").catch((error) => {
         markBillingAiProcessingError(event.id, error);
         console.error("Falha ao iniciar IA pelo polling de cobranca:", error.message);
