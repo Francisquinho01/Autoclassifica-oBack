@@ -4167,6 +4167,17 @@ async function syncNcmOfficial(actor = "sistema") {
   return { imported: rows.length, source: NCM_JSON_URL };
 }
 
+const MERCADO_PAGO_WEBHOOK_PATHS = new Set([
+  "/api/billing/mercado-pago/webhook",
+  "/api/mercado-pago/webhook",
+  "/api/webhooks/mercado-pago",
+  "/webhooks/mercado-pago",
+  "/webhook/mercado-pago",
+  "/mercado-pago/webhook",
+  "/mercadopago/webhook",
+  "/webhook"
+]);
+
 async function handleRequest(req, res) {
   if (req.method === "OPTIONS") return sendOptions(res);
   const url = new URL(req.url || "/", `http://${req.headers.host || "localhost"}`);
@@ -4226,7 +4237,15 @@ async function handleRequest(req, res) {
     return sendJson(res, 200, setAiBillingEnabled(Boolean(payload.enabled), payload.actor || "contador"));
   }
 
-  if (req.method === "POST" && ["/api/billing/mercado-pago/webhook", "/webhooks/mercado-pago", "/webhook/mercado-pago"].includes(path)) {
+  if (req.method === "GET" && MERCADO_PAGO_WEBHOOK_PATHS.has(path)) {
+    return sendJson(res, 200, {
+      ok: true,
+      service: "mercado_pago_webhook",
+      message: "Endpoint do webhook Mercado Pago ativo. Configure este mesmo endereço como URL de notificacao."
+    });
+  }
+
+  if (req.method === "POST" && MERCADO_PAGO_WEBHOOK_PATHS.has(path)) {
     const rawBody = decodeText(await readBody(req));
     const payload = rawBody ? parseJson(rawBody, {}) : {};
     const query = Object.fromEntries(url.searchParams.entries());
