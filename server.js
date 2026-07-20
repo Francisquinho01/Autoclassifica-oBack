@@ -2365,8 +2365,13 @@ function mapWebEvidenceItem(item, provider) {
   return { provider, title, url, snippet };
 }
 
+function buildNcmSearchQuery(productName) {
+  const cleanProduct = String(productName || "").replace(/\s+/g, " ").trim();
+  return `${cleanProduct || "produto"} NCM`;
+}
+
 async function fetchWebEvidence(productName, candidate, options = {}) {
-  const query = `${productName} NCM ${candidate?.codigo || ""} ${candidate?.descricao || ""}`.trim();
+  const query = buildNcmSearchQuery(productName);
   if (!options.useWeb) {
     return { status: "not_requested", query, items: [] };
   }
@@ -2676,15 +2681,18 @@ function assertOpenAiConfigured() {
 function aiNcmInstructions() {
   return [
     "Voce e um assistente fiscal para NCM no Brasil.",
-    "Faca uma pesquisa completa usando todos os dados enviados: base oficial/local NCM, candidatos ranqueados, regras validadas pelo contador, contexto fiscal e evidencia web quando existir.",
-    "Analise o produto digitado e escolha o NCM mais provavel usando os candidatos oficiais/localizados enviados pelo sistema.",
+    "Para cada produto, pesquise e classifique de forma direta usando a consulta principal product.search_query, sempre no formato: descricao do produto + NCM.",
+    "Analise o que o usuario digitou e retorne o NCM brasileiro mais correspondente ao produto exatamente como esta na lista.",
+    "Use todos os dados enviados: base oficial/local NCM, candidatos ranqueados, regras validadas pelo contador, contexto fiscal e evidencia web quando existir.",
     "O codigo final deve ser um NCM de 8 digitos presente em candidates, o NCM atual quando ele estiver correto, ou um NCM citado claramente em web_evidence.",
-    "Nao invente codigos. Se os candidatos e a evidencia web nao forem suficientes, retorne ncm 00000000, status uncertain e needs_review true.",
+    "Nao invente codigos. Se existir NCM oficial correspondente para o produto generico, use a categoria generica/outros mais correta em vez de bloquear por falta de especificacao.",
+    "Produto generico nao e motivo para retornar 00000000: queijo deve voltar NCM de queijo/outros queijos quando nao houver tipo especificado; smartwatch deve voltar NCM de smartwatch; racao gatos deve voltar alimento para gatos.",
+    "Se a descricao estiver pouco especificada, coloque isso apenas em warnings e ainda retorne should_apply true quando o NCM for oficial e coerente.",
+    "Retorne ncm 00000000 apenas quando nao houver NCM oficial confiavel nos candidatos, na evidencia web ou nas fontes enviadas.",
     "Diferencie produto base de acessorio ou uso: lapis escolar nao e apontador de lapis; lapis de maquiagem e cosmetico; rolo de pintura nao e reagente em rolos; racao de gatos ou cachorros e alimento para caes/gatos.",
     "Priorize frase especifica e categoria do produto sobre repeticao de palavra solta.",
     "Para impressora 3D, diferencie impressora comum de maquinas para fabricacao aditiva e use o material/processo quando existir.",
-    "Explique no campo reason por que aceitou ou recusou o NCM, citando a categoria do produto e os sinais dos candidatos.",
-    "Se houver termo ambiguo ou produto generico, deixe para revisao.",
+    "Explique no campo reason por que aplicou o NCM, citando a categoria do produto e os sinais dos candidatos/fontes.",
     "Retorne apenas JSON no formato do schema."
   ].join(" ");
 }
@@ -2735,6 +2743,7 @@ function compactAiBaseResults(baseResults = []) {
 
 async function buildAiNcmContext(classification, options = {}) {
   const productText = `${classification.descricao_original || ""} ${classification.marca || ""} ${classification.categoria || ""}`.trim();
+  const searchQuery = buildNcmSearchQuery(productText);
   const currentCode = normalizeNcmCode(classification.ncm);
   const currentRow = getOfficialNcmRow(currentCode);
   const fiscal = searchFiscal(productText, OPENAI_NCM_MAX_CANDIDATES);
@@ -2745,6 +2754,7 @@ async function buildAiNcmContext(classification, options = {}) {
   return {
     generated_at: now(),
     official_ncm_source: NCM_JSON_URL,
+    search_query: searchQuery,
     question: String(options.question || "").trim(),
     product: {
       id: classification.product_id,
@@ -2860,7 +2870,7 @@ async function callOpenAiNcmWebSearch(context) {
   const request = {
     model: OPENAI_NCM_MODEL,
     instructions:
-      "Pesquise na web fontes brasileiras sobre o NCM do produto informado. Priorize tabelas NCM, sites fiscais e descricoes oficiais. Responda curto, citando os NCMs encontrados e as fontes. Nao invente codigo.",
+      "Pesquise na web o NCM brasileiro correto do produto. Use como consulta principal o campo search_query, que ja vem como 'produto NCM'. Priorize tabelas NCM, sites fiscais e descricoes oficiais. Responda curto, citando os NCMs encontrados e as fontes. Nao invente codigo.",
     input: [
       {
         role: "user",
@@ -2868,6 +2878,7 @@ async function callOpenAiNcmWebSearch(context) {
           {
             type: "input_text",
             text: JSON.stringify({
+              search_query: context.search_query,
               product: context.product,
               current: context.current,
               local_best: context.local_best,
@@ -3031,6 +3042,26 @@ function pickWebEvidenceNcm(webEvidence, preferredCode) {
   return officialCodes.length === 1 ? officialCodes[0] : null;
 }
 
+function aiSourcesSupportNcm(sources = [], code) {
+  const cleanCode = normalizeNcmCode(code);
+  if (!cleanCode) return false;
+  return sources.some((source) => normalizeNcmCode(source?.code) === cleanCode);
+}
+
+function buildAiWarnings(ai, context, code) {
+  const warnings = Array.isArray(ai?.warnings) ? ai.warnings.map((item) => String(item)).filter(Boolean) : [];
+  const genericCandidate = [context.local_best, ...(context.candidates || [])].find(
+    (candidate) => normalizeNcmCode(candidate?.codigo) === code && candidate?.needs_specification
+  );
+  if (genericCandidate) {
+    const message =
+      genericCandidate.specification_message ||
+      "Produto pouco especificado; NCM aplicado pela categoria generica mais proxima.";
+    if (!warnings.some((warning) => normalizeText(warning) === normalizeText(message))) warnings.unshift(message);
+  }
+  return warnings.slice(0, 6);
+}
+
 function normalizeAiNcmResult(ai, context) {
   const aiNcm = normalizeNcmCode(ai?.ncm);
   const webEvidenceNcm = pickWebEvidenceNcm(context.web_evidence, aiNcm);
@@ -3040,32 +3071,36 @@ function normalizeAiNcmResult(ai, context) {
   const official = getOfficialNcmRow(cleanNcm);
   const fromCandidates = candidateCodes.has(cleanNcm) || (cleanNcm && cleanNcm === currentCode && Boolean(official));
   const fromWebEvidence = webEvidenceSupportsNcm(context.web_evidence, cleanNcm);
-  const acceptedByResearch = fromCandidates || fromWebEvidence;
-  const confidence = fromWebEvidence ? Math.max(clampConfidence(ai?.confidence), OPENAI_NCM_APPLY_THRESHOLD) : clampConfidence(ai?.confidence);
-  const safeToApply =
+  const fromAiSources = Boolean(official) && aiSourcesSupportNcm(ai?.sources || [], cleanNcm);
+  const acceptedByResearch = fromCandidates || fromWebEvidence || fromAiSources;
+  const researchedNcm =
     cleanNcm &&
     cleanNcm !== "00000000" &&
     Boolean(official) &&
-    acceptedByResearch &&
-    (fromWebEvidence || (ai?.status === "apply" && Boolean(ai?.should_apply))) &&
-    confidence >= OPENAI_NCM_APPLY_THRESHOLD;
+    acceptedByResearch;
+  const confidence = researchedNcm
+    ? Math.max(clampConfidence(ai?.confidence), OPENAI_NCM_APPLY_THRESHOLD)
+    : clampConfidence(ai?.confidence);
+  const safeToApply = Boolean(researchedNcm);
+  const warnings = buildAiWarnings(ai, context, cleanNcm);
   return {
     ncm: cleanNcm || "00000000",
     formatted: formatNcm(cleanNcm),
     descricao: official?.descricao || null,
     confidence,
-    status: fromWebEvidence ? "apply" : ai?.status || "uncertain",
-    should_apply: fromWebEvidence || Boolean(ai?.should_apply),
-    needs_review: Boolean(ai?.needs_review || !safeToApply),
+    status: safeToApply ? "apply" : ai?.status || "uncertain",
+    should_apply: safeToApply,
+    needs_review: !safeToApply,
     product_category: String(ai?.product_category || ""),
     reason: String(ai?.reason || ""),
-    warnings: Array.isArray(ai?.warnings) ? ai.warnings.map((item) => String(item)).slice(0, 6) : [],
+    warnings,
     sources: Array.isArray(ai?.sources) ? ai.sources.slice(0, 6) : [],
     eligible_to_apply: safeToApply,
     validation: {
       exists_in_official: Boolean(official),
       from_candidates: fromCandidates,
       from_web_evidence: fromWebEvidence,
+      from_ai_sources: fromAiSources,
       web_evidence_ncm: webEvidenceNcm?.codigo || null,
       web_evidence_ncm_count: webEvidenceNcm?.count || 0,
       threshold: OPENAI_NCM_APPLY_THRESHOLD
@@ -3089,9 +3124,9 @@ async function buildAiNcmSuggestion(classification, options = {}) {
     result,
     billing: options.billing || null,
     message: result.eligible_to_apply
-      ? `Inteligencia artificial sugeriu ${result.ncm} com ${Math.round(result.confidence * 100)}% de confianca.`
+      ? `Inteligencia artificial aplicou ${result.ncm} com ${Math.round(result.confidence * 100)}% de confianca.`
       : `Inteligencia artificial deixou para revisao: ${result.reason || "sem confianca suficiente."}`,
-    policy: "O backend so aplica se o NCM existir na tabela oficial/local, estiver entre os candidatos ou na evidencia web, e passar do limite."
+    policy: "O backend aplica automaticamente quando o NCM existe na tabela oficial/local e foi sustentado por candidato, evidencia web ou fonte da IA."
   };
 }
 
