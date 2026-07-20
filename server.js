@@ -37,7 +37,7 @@ const NCM_JSON_URL =
 const NCM_WEB_EVIDENCE_PROVIDER = String(process.env.NCM_WEB_EVIDENCE_PROVIDER || "auto").toLowerCase();
 const NCM_WEB_EVIDENCE_LIMIT = Math.min(Math.max(Number(process.env.NCM_WEB_EVIDENCE_LIMIT || 5), 1), 10);
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
-const OPENAI_NCM_MODEL = process.env.OPENAI_NCM_MODEL || "gpt-5.6-luna";
+const OPENAI_NCM_MODEL = process.env.OPENAI_NCM_MODEL || "gpt-5-mini";
 const OPENAI_NCM_API_URL = process.env.OPENAI_NCM_API_URL || "https://api.openai.com/v1/responses";
 const OPENAI_NCM_APPLY_THRESHOLD = Math.min(Math.max(Number(process.env.OPENAI_NCM_APPLY_THRESHOLD || 0.82), 0.5), 0.99);
 const OPENAI_NCM_MAX_CANDIDATES = Math.min(Math.max(Number(process.env.OPENAI_NCM_MAX_CANDIDATES || 8), 3), 15);
@@ -2135,18 +2135,59 @@ async function prepareAiBilling({ classificationId = null, quantity = 1, actor =
   }
 }
 
+function rowToAiBillingEvent(row) {
+  return row ? { ...row, metadata: parseJson(row.metadata_json, {}) } : null;
+}
+
 function getAiBillingEvent(id) {
   const eventId = Number(id || 0);
   if (!eventId) return null;
   const row = db.prepare("SELECT * FROM ai_billing_events WHERE id = ?").get(eventId);
-  return row ? { ...row, metadata: parseJson(row.metadata_json, {}) } : null;
+  return rowToAiBillingEvent(row);
+}
+
+function getAiBillingEventByProviderReference(reference) {
+  const cleanReference = String(reference || "").trim();
+  if (!cleanReference) return null;
+  const row = db
+    .prepare("SELECT * FROM ai_billing_events WHERE provider = 'mercado_pago' AND provider_reference = ? ORDER BY id DESC LIMIT 1")
+    .get(cleanReference);
+  return rowToAiBillingEvent(row);
 }
 
 function getAiBillingEventByPaymentId(paymentId) {
-  const cleanPaymentId = String(paymentId || "").trim();
-  if (!cleanPaymentId) return null;
-  const row = db.prepare("SELECT * FROM ai_billing_events WHERE provider = 'mercado_pago' AND provider_reference = ? ORDER BY id DESC LIMIT 1").get(cleanPaymentId);
-  return row ? { ...row, metadata: parseJson(row.metadata_json, {}) } : null;
+  return getAiBillingEventByProviderReference(paymentId);
+}
+
+function getAiBillingEventFromPaymentPayload(paymentPayload = {}) {
+  const metadata = paymentPayload.metadata || {};
+  const metadataEvent = getAiBillingEvent(metadata.billing_event_id || metadata.billingEventId);
+  if (metadataEvent) return metadataEvent;
+
+  const direct =
+    getAiBillingEventByProviderReference(paymentPayload.id) ||
+    getAiBillingEventByProviderReference(paymentPayload.external_reference);
+  if (direct) return direct;
+
+  const references = new Set(
+    [paymentPayload.id, paymentPayload.external_reference]
+      .map((value) => String(value || "").trim())
+      .filter(Boolean)
+  );
+  if (!references.size) return null;
+
+  const rows = db
+    .prepare("SELECT * FROM ai_billing_events WHERE provider = 'mercado_pago' ORDER BY id DESC LIMIT 100")
+    .all();
+  for (const row of rows) {
+    const event = rowToAiBillingEvent(row);
+    const payment = event?.metadata?.payment || {};
+    const eventReferences = [payment.payment_id, payment.external_reference, payment.id, event.provider_reference]
+      .map((value) => String(value || "").trim())
+      .filter(Boolean);
+    if (eventReferences.some((reference) => references.has(reference))) return event;
+  }
+  return null;
 }
 
 function publicBillingFromEvent(event, overrides = {}) {
@@ -2155,6 +2196,7 @@ function publicBillingFromEvent(event, overrides = {}) {
   const paymentStatus = overrides.payment_status || payment.payment_status || event?.status || "pending";
   const paid = paymentStatus === "approved" || overrides.status === "paid" || event?.status === "paid";
   const publicStatus = paid && event?.status === "processing_ai" ? "processing_ai" : paid ? "paid" : overrides.status || event?.status || "pending";
+  const aiError = metadata?.ai_processing_error?.message || null;
   return {
     enabled: true,
     event_id: event?.id || overrides.event_id || null,
@@ -2165,6 +2207,7 @@ function publicBillingFromEvent(event, overrides = {}) {
     requires_payment: !paid,
     ai_processing: Boolean(metadata?.ai_processing_started_at && !metadata?.ai_processed_at),
     ai_processed: Boolean(metadata?.ai_processed_at),
+    ai_error: aiError,
     quantity: Number(event?.quantity || overrides.quantity || 1),
     amount_cents: Number(event?.amount_cents || overrides.amount_cents || 0),
     amount_brl: moneyFromCents(event?.amount_cents || overrides.amount_cents || 0),
@@ -2175,7 +2218,13 @@ function publicBillingFromEvent(event, overrides = {}) {
     qr_code: overrides.qr_code || payment.qr_code || null,
     ticket_url: overrides.ticket_url || payment.ticket_url || event?.checkout_url || null,
     checkout_url: overrides.checkout_url || payment.ticket_url || event?.checkout_url || null,
-    message: publicStatus === "processing_ai" ? "Pagamento confirmado. IA processando automaticamente." : paid ? "Pagamento confirmado. IA liberada." : "Pagamento ainda nao confirmado."
+    message: aiError
+      ? `Pagamento confirmado, mas a IA falhou: ${aiError}`
+      : publicStatus === "processing_ai"
+        ? "Pagamento confirmado. IA processando automaticamente."
+        : paid
+          ? "Pagamento confirmado. IA liberada."
+          : "Pagamento ainda nao confirmado."
   };
 }
 
@@ -3424,27 +3473,89 @@ function isMercadoPagoPaymentWebhook(body = {}, query = {}) {
   return !topic || topic.includes("payment");
 }
 
+function logMercadoPagoWebhook(body = {}, payment = null, result = {}) {
+  try {
+    logAudit(
+      "billing",
+      result.event_id || null,
+      "mercado_pago_webhook",
+      "mercado_pago",
+      {
+        action: body.action || null,
+        type: body.type || null,
+        data_id: body.data?.id || null
+      },
+      {
+        ...result,
+        payment_id: result.payment_id || payment?.id || body.data?.id || null,
+        payment_status: payment?.status || null,
+        external_reference: payment?.external_reference || null
+      },
+      {
+        source_table: "mercado_pago",
+        table_version: payment?.id || body.data?.id || null,
+        effective_date: now().slice(0, 10)
+      }
+    );
+  } catch (error) {
+    console.error("Falha ao registrar webhook Mercado Pago:", error.message);
+  }
+}
+
 async function handleMercadoPagoBillingWebhook(body = {}, query = {}) {
   if (!isMercadoPagoPaymentWebhook(body, query)) {
-    return { received: true, ignored: true, reason: "not_payment_notification" };
+    const result = { received: true, ignored: true, reason: "not_payment_notification" };
+    logMercadoPagoWebhook(body, null, result);
+    return result;
   }
   const paymentId = extractMercadoPagoPaymentId(body, query);
-  if (!paymentId) return { received: true, ignored: true, reason: "missing_payment_id" };
+  if (!paymentId) {
+    const result = { received: true, ignored: true, reason: "missing_payment_id" };
+    logMercadoPagoWebhook(body, null, result);
+    return result;
+  }
 
   const payment = await fetchMercadoPagoPaymentById(paymentId);
-  const event = getAiBillingEventByPaymentId(payment.id || paymentId);
-  if (!event) return { received: true, ignored: true, reason: "billing_event_not_found", payment_id: payment.id || paymentId };
+  const event = getAiBillingEventFromPaymentPayload(payment);
+  if (!event) {
+    const result = {
+      received: true,
+      ignored: true,
+      reason: "billing_event_not_found",
+      payment_id: payment.id || paymentId,
+      payment_status: payment.status || null,
+      external_reference: payment.external_reference || null
+    };
+    logMercadoPagoWebhook(body, payment, result);
+    return result;
+  }
 
   const updatedEvent = updateBillingEventWithPaymentPayload(event, payment);
   if (payment.status === "approved") {
+    const result = {
+      received: true,
+      event_id: updatedEvent.id,
+      payment_id: payment.id || paymentId,
+      status: payment.status,
+      ai_processing: true
+    };
     processPaidAiBillingEvent(updatedEvent.id, "mercado_pago_webhook").catch((error) => {
       markBillingAiProcessingError(updatedEvent.id, error);
       console.error("Falha ao iniciar IA pelo webhook Mercado Pago:", error.message);
     });
-    return { received: true, payment_id: payment.id || paymentId, status: payment.status, ai_processing: true };
+    logMercadoPagoWebhook(body, payment, result);
+    return result;
   }
 
-  return { received: true, payment_id: payment.id || paymentId, status: payment.status, ai_processing: false };
+  const result = {
+    received: true,
+    event_id: updatedEvent.id,
+    payment_id: payment.id || paymentId,
+    status: payment.status,
+    ai_processing: false
+  };
+  logMercadoPagoWebhook(body, payment, result);
+  return result;
 }
 
 function getCfopPair(operationType, company) {
