@@ -46,7 +46,7 @@ const OPENAI_NCM_MAX_OUTPUT_TOKENS = Math.min(Math.max(Number(process.env.OPENAI
 const OPENAI_NCM_WEB_SEARCH_ENABLED = String(process.env.OPENAI_NCM_WEB_SEARCH_ENABLED || "true").toLowerCase() !== "false";
 const MERCADO_PAGO_ACCESS_TOKEN = process.env.MERCADO_PAGO_ACCESS_TOKEN || "";
 const AI_BILLING_PRICE_CENTS = Math.min(Math.max(Number(process.env.AI_BILLING_PRICE_CENTS || 10), 1), 100000);
-const AI_BILLING_DEFAULT_ENABLED = String(process.env.AI_BILLING_DEFAULT_ENABLED || "false").toLowerCase() === "true";
+const AI_BILLING_DEFAULT_ENABLED = true;
 const AI_BILLING_TRUST_PAYMENT_UPDATED_WEBHOOK =
   String(process.env.AI_BILLING_TRUST_PAYMENT_UPDATED_WEBHOOK || "true").toLowerCase() !== "false";
 const AI_BILLING_PROCESSING_LOCK_MS = Math.min(
@@ -1959,7 +1959,7 @@ function setAppSetting(key, value) {
 }
 
 function billingEnabled() {
-  return Boolean(getAppSetting("ai_billing_enabled", AI_BILLING_DEFAULT_ENABLED));
+  return AI_BILLING_DEFAULT_ENABLED;
 }
 
 function moneyFromCents(cents) {
@@ -1971,7 +1971,7 @@ function aiBillingConfig() {
   const activeProcessing = getActiveAiProcessingEvent();
   return {
     enabled,
-    mode: enabled ? "mercado_pago_pix_qr" : "test_free",
+    mode: "mercado_pago_pix_qr",
     price_cents: AI_BILLING_PRICE_CENTS,
     price_brl: moneyFromCents(AI_BILLING_PRICE_CENTS),
     currency: "BRL",
@@ -1979,9 +1979,7 @@ function aiBillingConfig() {
     mercado_pago_token_hint: MERCADO_PAGO_ACCESS_TOKEN ? `${MERCADO_PAGO_ACCESS_TOKEN.slice(0, 8)}...${MERCADO_PAGO_ACCESS_TOKEN.slice(-4)}` : null,
     processing_locked: Boolean(activeProcessing),
     active_processing: activeProcessing ? publicBillingFromEvent(activeProcessing) : null,
-    note: enabled
-      ? "Cobrança ligada: cada uso da IA gera uma cobrança Mercado Pago."
-      : "Cobrança desligada: modo teste, nenhum uso da IA gera cobrança."
+    note: "Pagamento da IA sempre ligado: cada uso gera Pix Mercado Pago antes de processar."
   };
 }
 
@@ -1992,10 +1990,8 @@ function billingPayerEmail() {
 }
 
 function setAiBillingEnabled(enabled, actor = "contador") {
-  const previous = aiBillingConfig();
-  setAppSetting("ai_billing_enabled", Boolean(enabled));
   const next = aiBillingConfig();
-  logAudit("settings", null, "toggle_ai_billing", actor, previous, next);
+  logAudit("settings", null, "billing_always_enabled", actor, { requested_enabled: Boolean(enabled) }, next);
   return next;
 }
 
@@ -2076,7 +2072,7 @@ async function prepareAiBilling({ classificationId = null, quantity = 1, actor =
       quantity: cleanQuantity,
       amount_cents: 0,
       amount_brl: 0,
-      message: "Cobrança desligada para teste."
+      message: "Pagamento da IA obrigatorio."
     };
   }
   assertAiProcessingUnlocked();
@@ -2385,7 +2381,7 @@ async function resolveAiBillingForUse({ classificationId = null, quantity = 1, a
       quantity,
       amount_cents: 0,
       amount_brl: 0,
-      message: "Cobrança desligada para teste."
+      message: "Pagamento da IA obrigatorio."
     };
   }
 
@@ -4328,50 +4324,75 @@ function exportFilename(extension) {
     .replace(/[^a-z0-9]+/g, "-")
     .replace(/^-+|-+$/g, "")
     .slice(0, 60);
-  return `classificacao-produtos-${base || "empresa"}.${extension}`;
+  return `dados-fiscais-${base || "empresa"}.${extension}`;
+}
+
+const EXPORT_PRODUCT_HEADERS = [
+  "Produto",
+  "Unidade",
+  "NCM",
+  "CEST",
+  "CFOP interno",
+  "CFOP interestadual",
+  "CST ICMS",
+  "CSOSN",
+  "Origem",
+  "CST PIS",
+  "Aliquota PIS",
+  "CST COFINS",
+  "Aliquota COFINS",
+  "CST IBS/CBS",
+  "cClassTrib",
+  "IPI",
+  "cBenef",
+  "vTotTrib"
+];
+
+function cleanExportProductName(item) {
+  const original = String(item?.descricao_original || item?.descricao_tratada || "").trim();
+  return original.replace(/^\s*\d+\s*[\-.)]\s*/, "").trim() || original;
+}
+
+function buildExportCompanyRows(company = getCompany()) {
+  return [
+    ["Empresa", companyExportName(company)],
+    ["CNPJ", company?.cnpj || ""],
+    ["UF", company?.uf || ""],
+    ["Municipio", company?.municipio || ""],
+    ["Regime", company?.regime_tributario || ""],
+    ["Gerado em", new Date().toLocaleString("pt-BR", { timeZone: "America/Sao_Paulo" })]
+  ];
 }
 
 function buildExportRows() {
-  const company = getCompany();
-  const empresa = companyExportName(company);
   return listClassifications({ limit: 1000 }).map((item) => ({
-    Empresa: empresa,
-    "CNPJ empresa": company?.cnpj || "",
-    Codigo: item.codigo_produto,
-    "Descricao original": item.descricao_original,
-    "Descricao tratada": item.descricao_tratada,
-    Unidade: item.unidade,
-    NCM: item.ncm,
-    CEST: item.cest,
-    "CFOP interno": item.cfop_interno,
-    "CFOP interestadual": item.cfop_interestadual,
-    "CST ICMS": item.cst_icms,
-    CSOSN: item.csosn,
-    Origem: item.origem,
-    "CST PIS": item.cst_pis,
-    "Aliquota PIS": item.aliquota_pis,
-    "CST COFINS": item.cst_cofins,
-    "Aliquota COFINS": item.aliquota_cofins,
-    "CST IBS/CBS": item.ibs_cbs_cst,
-    cClassTrib: item.cclass_trib,
-    IPI: item.ipi,
-    cBenef: item.cbenef,
-    vTotTrib: item.vtottrib,
-    Confianca: item.confianca,
-    Status: item.status,
-    Observacao: item.observacao
+    Produto: cleanExportProductName(item),
+    Unidade: item.unidade || "UN",
+    NCM: item.ncm || "",
+    CEST: item.cest || "",
+    "CFOP interno": item.cfop_interno || "",
+    "CFOP interestadual": item.cfop_interestadual || "",
+    "CST ICMS": item.cst_icms || "",
+    CSOSN: item.csosn || "",
+    Origem: item.origem || "",
+    "CST PIS": item.cst_pis || "",
+    "Aliquota PIS": item.aliquota_pis ?? "",
+    "CST COFINS": item.cst_cofins || "",
+    "Aliquota COFINS": item.aliquota_cofins ?? "",
+    "CST IBS/CBS": item.ibs_cbs_cst || "",
+    cClassTrib: item.cclass_trib || "",
+    IPI: item.ipi ?? "",
+    cBenef: item.cbenef || "",
+    vTotTrib: item.vtottrib ?? ""
   }));
 }
 
 function buildCsvExport() {
   const rows = buildExportRows();
-  const headers = Object.keys(rows[0] || {
-    Codigo: "",
-    "Descricao original": "",
-    NCM: "",
-    Status: ""
-  });
+  const headers = EXPORT_PRODUCT_HEADERS;
   return [
+    ...buildExportCompanyRows().map((row) => row.map(escapeCsv).join(";")),
+    "",
     headers.map(escapeCsv).join(";"),
     ...rows.map((row) => headers.map((header) => escapeCsv(row[header])).join(";"))
   ].join("\r\n");
@@ -4388,25 +4409,39 @@ async function buildXlsxExport() {
   }
   const company = getCompany();
   const rows = buildExportRows();
-  const worksheet = XLSX.utils.aoa_to_sheet([
-    ["Empresa", companyExportName(company)],
-    ["CNPJ", company?.cnpj || ""],
-    ["UF", company?.uf || ""],
-    ["Gerado em", new Date().toLocaleString("pt-BR", { timeZone: "America/Sao_Paulo" })],
-    []
-  ]);
-  XLSX.utils.sheet_add_json(worksheet, rows, { origin: "A6" });
+  const companyRows = buildExportCompanyRows(company);
+  const worksheetRows = [
+    ...companyRows,
+    [],
+    EXPORT_PRODUCT_HEADERS,
+    ...rows.map((row) => EXPORT_PRODUCT_HEADERS.map((header) => row[header]))
+  ];
+  const worksheet = XLSX.utils.aoa_to_sheet(worksheetRows);
+  const headerRowNumber = companyRows.length + 2;
+  const lastColumn = XLSX.utils.encode_col(EXPORT_PRODUCT_HEADERS.length - 1);
+  worksheet["!autofilter"] = { ref: `A${headerRowNumber}:${lastColumn}${headerRowNumber}` };
   worksheet["!cols"] = [
-    { wch: 28 },
-    { wch: 18 },
-    { wch: 14 },
-    { wch: 38 },
-    { wch: 34 },
+    { wch: 44 },
     { wch: 10 },
-    { wch: 10 }
+    { wch: 12 },
+    { wch: 12 },
+    { wch: 14 },
+    { wch: 18 },
+    { wch: 12 },
+    { wch: 10 },
+    { wch: 10 },
+    { wch: 10 },
+    { wch: 12 },
+    { wch: 12 },
+    { wch: 14 },
+    { wch: 12 },
+    { wch: 14 },
+    { wch: 10 },
+    { wch: 14 },
+    { wch: 12 }
   ];
   const workbook = XLSX.utils.book_new();
-  XLSX.utils.book_append_sheet(workbook, worksheet, "Produtos classificados");
+  XLSX.utils.book_append_sheet(workbook, worksheet, "Dados fiscais");
   return XLSX.write(workbook, { type: "buffer", bookType: "xlsx" });
 }
 
