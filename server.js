@@ -1919,8 +1919,8 @@ function ncmRobotConfig() {
     },
     openai: aiNcmConfig(),
     external_ai_cost: OPENAI_API_KEY
-      ? "IA configurada. Cada consulta usa tokens da OpenAI conforme o modelo escolhido."
-      : "IA nao configurada. Coloque OPENAI_API_KEY no AutoBack/.env para ativar."
+      ? "Classificador automatico configurado. Cada consulta usa creditos conforme o modelo escolhido."
+      : "Classificador automatico nao configurado. Coloque a chave no AutoBack/.env para ativar."
   };
 }
 
@@ -1935,7 +1935,7 @@ function aiNcmConfig() {
     web_search_enabled: OPENAI_NCM_WEB_SEARCH_ENABLED,
     key_hint: OPENAI_API_KEY ? `${OPENAI_API_KEY.slice(0, 7)}...${OPENAI_API_KEY.slice(-4)}` : null,
     billing: aiBillingConfig(),
-    policy: "A IA escolhe entre candidatos oficiais/locais, evidencia web e so aplica automaticamente acima do limite de confianca."
+    policy: "O classificador escolhe entre candidatos oficiais/locais, evidencia web e so aplica automaticamente acima do limite de confianca."
   };
 }
 
@@ -1979,7 +1979,7 @@ function aiBillingConfig() {
     mercado_pago_token_hint: MERCADO_PAGO_ACCESS_TOKEN ? `${MERCADO_PAGO_ACCESS_TOKEN.slice(0, 8)}...${MERCADO_PAGO_ACCESS_TOKEN.slice(-4)}` : null,
     processing_locked: Boolean(activeProcessing),
     active_processing: activeProcessing ? publicBillingFromEvent(activeProcessing) : null,
-    note: "Pagamento da IA sempre ligado: cada uso gera Pix Mercado Pago antes de processar."
+    note: "Pagamento do classificador sempre ligado: cada uso gera Pix Mercado Pago antes de processar."
   };
 }
 
@@ -2072,7 +2072,7 @@ async function prepareAiBilling({ classificationId = null, quantity = 1, actor =
       quantity: cleanQuantity,
       amount_cents: 0,
       amount_brl: 0,
-      message: "Pagamento da IA obrigatorio."
+      message: "Pagamento do classificador obrigatorio."
     };
   }
   assertAiProcessingUnlocked();
@@ -2095,7 +2095,7 @@ async function prepareAiBilling({ classificationId = null, quantity = 1, actor =
   const eventId = Number(insert.lastInsertRowid);
   try {
     const payment = await createMercadoPagoPixPayment({
-      description: "Conferencia e sugestao de NCM por IA no Aikkie AutoClass Fiscal",
+      description: "Conferencia e sugestao de NCM no Aikkie AutoClass Fiscal",
       amountCents,
       quantity: cleanQuantity,
       metadata: { billing_event_id: eventId, classification_id: classificationId, actor, context }
@@ -2131,7 +2131,7 @@ async function prepareAiBilling({ classificationId = null, quantity = 1, actor =
       qr_code: payment.qr_code,
       ticket_url: payment.ticket_url,
       checkout_url: payment.ticket_url,
-      message: `Pix Mercado Pago gerado: R$ ${moneyFromCents(amountCents).toFixed(2)}. Pague para liberar a IA.`
+      message: `Pix Mercado Pago gerado: R$ ${moneyFromCents(amountCents).toFixed(2)}. Pague para iniciar a auto classificacao.`
     };
   } catch (error) {
     db.prepare("UPDATE ai_billing_events SET status = 'error', metadata_json = ?, updated_at = ? WHERE id = ?").run(
@@ -2227,11 +2227,11 @@ function publicBillingFromEvent(event, overrides = {}) {
     ticket_url: overrides.ticket_url || payment.ticket_url || event?.checkout_url || null,
     checkout_url: overrides.checkout_url || payment.ticket_url || event?.checkout_url || null,
     message: aiError
-      ? `Pagamento confirmado, mas a IA falhou: ${aiError}`
+      ? `Pagamento confirmado, mas a auto classificacao falhou: ${aiError}`
       : publicStatus === "processing_ai"
-        ? "Pagamento confirmado. IA processando automaticamente."
+        ? "Pagamento confirmado. Auto classificacao em andamento."
         : paid
-          ? "Pagamento confirmado. IA liberada."
+          ? "Pagamento confirmado. Auto classificacao liberada."
           : "Pagamento ainda nao confirmado."
   };
 }
@@ -2259,7 +2259,7 @@ function getActiveAiProcessingEvent() {
 function assertAiProcessingUnlocked(allowedEventId = null) {
   const active = getActiveAiProcessingEvent();
   if (!active || Number(active.id) === Number(allowedEventId || 0)) return;
-  const error = new Error("A IA esta classificando os produtos agora. Aguarde finalizar antes de alterar a tabela ou gerar outro pagamento.");
+  const error = new Error("A auto classificacao esta processando os produtos agora. Aguarde finalizar antes de alterar a tabela ou gerar outro pagamento.");
   error.status = 409;
   error.active_billing = publicBillingFromEvent(active);
   throw error;
@@ -2381,7 +2381,7 @@ async function resolveAiBillingForUse({ classificationId = null, quantity = 1, a
       quantity,
       amount_cents: 0,
       amount_brl: 0,
-      message: "Pagamento da IA obrigatorio."
+      message: "Pagamento do classificador obrigatorio."
     };
   }
 
@@ -2394,7 +2394,7 @@ async function resolveAiBillingForUse({ classificationId = null, quantity = 1, a
       throw error;
     }
     if (context && event.metadata?.context && event.metadata.context !== context) {
-      const error = new Error("Esta cobrança pertence a outro fluxo de IA.");
+      const error = new Error("Esta cobrança pertence a outro fluxo de auto classificacao.");
       error.status = 409;
       throw error;
     }
@@ -2763,7 +2763,7 @@ const AI_NCM_SCHEMA = {
 
 function assertOpenAiConfigured() {
   if (OPENAI_API_KEY) return;
-  const error = new Error("OpenAI nao configurada. Coloque OPENAI_API_KEY no arquivo AutoBack/.env e reinicie o backend.");
+  const error = new Error("Classificador automatico nao configurado. Coloque a chave no arquivo AutoBack/.env e reinicie o backend.");
   error.status = 422;
   throw error;
 }
@@ -2902,7 +2902,7 @@ function collectOpenAiWebEvidence(payload) {
   const seen = new Set();
   const pushItem = (item = {}) => {
     const url = item.url || item.link || item.source_website_url || item.image_url || "";
-    const title = item.title || item.name || item.caption || url || "Fonte web OpenAI";
+    const title = item.title || item.name || item.caption || url || "Fonte web do classificador";
     const snippet = item.snippet || item.text || item.description || item.caption || "";
     const key = `${url}|${title}|${snippet}`;
     if (!url && !snippet) return;
@@ -2919,7 +2919,7 @@ function collectOpenAiWebEvidence(payload) {
       const contentText = content.text || content.output_text || "";
       if (contentText) {
         pushItem({
-          title: "Resumo da pesquisa web OpenAI",
+          title: "Resumo da pesquisa web do classificador",
           url: "",
           snippet: contentText
         });
@@ -3065,8 +3065,8 @@ async function callOpenAiNcm(context) {
     const contentType = response.headers.get("content-type") || "";
     const payload = contentType.includes("application/json") ? await response.json() : { error: await response.text() };
     if (!response.ok) {
-      const message = payload?.error?.message || payload?.error || `OpenAI HTTP ${response.status}`;
-      const error = new Error(`Falha na OpenAI: ${message}`);
+      const message = payload?.error?.message || payload?.error || `Classificador HTTP ${response.status}`;
+      const error = new Error(`Falha no classificador automatico: ${message}`);
       error.status = response.status === 401 ? 422 : 502;
       throw error;
     }
@@ -3078,7 +3078,7 @@ async function callOpenAiNcm(context) {
       usage: payload.usage || null,
       raw_text: outputText,
       parsed,
-      parse_error: parsed ? null : "A OpenAI respondeu sem JSON valido para o NCM."
+      parse_error: parsed ? null : "O classificador automatico respondeu sem JSON valido para o NCM."
     };
   } finally {
     clearTimeout(timeout);
@@ -3217,10 +3217,10 @@ function buildFallbackAiNcmResult(context, rawText = "", parseError = null) {
     needs_review: !hasNcm,
     product_category: context.product?.descricao || "",
     reason: hasNcm
-      ? `OpenAI nao retornou JSON valido; NCM aplicado por fallback usando ${picked.source}.`
-      : `OpenAI nao retornou JSON valido e nenhum NCM oficial seguro foi encontrado. ${parseError || ""}`.trim(),
+      ? `Classificador automatico nao retornou JSON valido; NCM aplicado por fallback usando ${picked.source}.`
+      : `Classificador automatico nao retornou JSON valido e nenhum NCM oficial seguro foi encontrado. ${parseError || ""}`.trim(),
     warnings: [
-      parseError || "OpenAI respondeu fora do JSON esperado.",
+      parseError || "Classificador automatico respondeu fora do JSON esperado.",
       hasNcm ? "Resultado aplicado por fallback tecnico; contador deve conferir a classificacao." : "Revisar manualmente."
     ],
     sources: hasNcm
@@ -3254,7 +3254,7 @@ function normalizeAiNcmResult(ai, context) {
   const safeToApply = Boolean(researchedNcm);
   const warnings = buildAiWarnings(ai, context, cleanNcm);
   const sourceDescription = aiSourceDescription(ai?.sources || [], cleanNcm);
-  const description = official?.descricao || sourceDescription || webEvidenceNcm?.row?.descricao || "NCM aplicado por evidencia da IA/web";
+  const description = official?.descricao || sourceDescription || webEvidenceNcm?.row?.descricao || "NCM aplicado por evidencia automatica/web";
   return {
     ncm: cleanNcm || "00000000",
     formatted: formatNcm(cleanNcm),
@@ -3298,9 +3298,9 @@ async function buildAiNcmSuggestion(classification, options = {}) {
     result,
     billing: options.billing || null,
     message: result.eligible_to_apply
-      ? `Inteligencia artificial aplicou ${result.ncm} com ${Math.round(result.confidence * 100)}% de confianca.`
-      : `Inteligencia artificial deixou para revisao: ${result.reason || "sem confianca suficiente."}`,
-    policy: "O backend aplica automaticamente quando o NCM existe na tabela oficial/local e foi sustentado por candidato, evidencia web ou fonte da IA."
+      ? `Classificador automatico aplicou ${result.ncm} com ${Math.round(result.confidence * 100)}% de confianca.`
+      : `Classificador automatico deixou para revisao: ${result.reason || "sem confianca suficiente."}`,
+    policy: "O backend aplica automaticamente quando o NCM existe na tabela oficial/local e foi sustentado por candidato, evidencia web ou fonte automatica."
   };
 }
 
@@ -3363,8 +3363,8 @@ function updateClassificationAiNcm(id, aiCheck, options = {}, actor = "contador"
   const nextSuggestion = { ...currentSuggestion, ai_ncm: nextAiCheck };
   const confidence = canApply ? Math.max(Number(previous.confianca || 0), aiCheck.result.confidence) : previous.confianca;
   const observation = canApply
-    ? `NCM e fiscal aplicados pela inteligencia artificial: ${aiCheck.result.ncm} - ${aiCheck.result.descricao || aiCheck.result.reason}`
-    : `${previous.observacao || ""}${previous.observacao ? " " : ""}IA: ${aiCheck.result?.reason || "revisar manualmente."}`.trim();
+    ? `NCM e fiscal aplicados pelo classificador automatico: ${aiCheck.result.ncm} - ${aiCheck.result.descricao || aiCheck.result.reason}`
+    : `${previous.observacao || ""}${previous.observacao ? " " : ""}Auto classificacao: ${aiCheck.result?.reason || "revisar manualmente."}`.trim();
 
   db.prepare(
     `
@@ -3416,7 +3416,7 @@ function updateClassificationAiBilling(id, billing, actor = "contador") {
   const nextSuggestion = { ...currentSuggestion, ai_ncm_billing: billing };
   db.prepare("UPDATE classifications SET sugestao_json = ?, observacao = ?, updated_at = ? WHERE id = ?").run(
     asJson(nextSuggestion),
-    billing.requires_payment ? "Pix gerado. A inteligencia artificial sera liberada apos confirmar o pagamento." : previous.observacao,
+    billing.requires_payment ? "Pix gerado. A auto classificacao sera liberada apos confirmar o pagamento." : previous.observacao,
     now(),
     id
   );
@@ -3577,7 +3577,7 @@ async function processPaidAiBillingEvent(eventId, actor = "mercado_pago_webhook"
     return { processed: true, context, result };
   } catch (error) {
     markBillingAiProcessingError(event.id, error);
-    console.error("Falha ao processar IA apos webhook Mercado Pago:", error.message);
+    console.error("Falha ao processar auto classificacao apos webhook Mercado Pago:", error.message);
     return { processed: false, reason: "processing_error", error: error.message };
   }
 }
@@ -3693,7 +3693,7 @@ async function handleMercadoPagoBillingWebhook(body = {}, query = {}) {
       };
       processPaidAiBillingEvent(updatedEvent.id, "mercado_pago_webhook_trusted").catch((processingError) => {
         markBillingAiProcessingError(updatedEvent.id, processingError);
-        console.error("Falha ao iniciar IA pelo webhook Mercado Pago confiavel:", processingError.message);
+        console.error("Falha ao iniciar auto classificacao pelo webhook Mercado Pago confiavel:", processingError.message);
       });
       logMercadoPagoWebhook(body, payment, result);
       return result;
@@ -3734,7 +3734,7 @@ async function handleMercadoPagoBillingWebhook(body = {}, query = {}) {
     };
     processPaidAiBillingEvent(updatedEvent.id, "mercado_pago_webhook").catch((error) => {
       markBillingAiProcessingError(updatedEvent.id, error);
-      console.error("Falha ao iniciar IA pelo webhook Mercado Pago:", error.message);
+      console.error("Falha ao iniciar auto classificacao pelo webhook Mercado Pago:", error.message);
     });
     logMercadoPagoWebhook(body, payment, result);
     return result;
@@ -4587,7 +4587,7 @@ async function handleRequest(req, res) {
     if (shouldStartAiFromBillingStatus(event, billing)) {
       processPaidAiBillingEvent(event.id, "billing_status_poll").catch((error) => {
         markBillingAiProcessingError(event.id, error);
-        console.error("Falha ao iniciar IA pelo polling de cobranca:", error.message);
+        console.error("Falha ao iniciar auto classificacao pelo polling de cobranca:", error.message);
       });
       event = getAiBillingEvent(event.id) || event;
       billing = publicBillingFromEvent(event);
