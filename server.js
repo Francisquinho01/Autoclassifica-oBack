@@ -1966,6 +1966,12 @@ function moneyFromCents(cents) {
   return Number((Number(cents || 0) / 100).toFixed(2));
 }
 
+function normalizeMercadoPagoPaymentId(value) {
+  const clean = String(value ?? "").trim();
+  const match = clean.match(/^(\d+)\.0+$/);
+  return match ? match[1] : clean;
+}
+
 function aiBillingConfig() {
   const enabled = billingEnabled();
   const activeProcessing = getActiveAiProcessingEvent();
@@ -2049,7 +2055,7 @@ async function createMercadoPagoPixPayment({ description, amountCents, quantity,
   return {
     provider: "mercado_pago",
     external_reference: externalReference,
-    payment_id: payload.id || null,
+    payment_id: normalizeMercadoPagoPaymentId(payload.id || ""),
     payment_status: payload.status || "pending",
     status_detail: payload.status_detail || null,
     qr_code_base64: transactionData.qr_code_base64 || null,
@@ -2157,14 +2163,75 @@ function getAiBillingEvent(id) {
 function getAiBillingEventByProviderReference(reference) {
   const cleanReference = String(reference || "").trim();
   if (!cleanReference) return null;
-  const row = db
-    .prepare("SELECT * FROM ai_billing_events WHERE provider = 'mercado_pago' AND provider_reference = ? ORDER BY id DESC LIMIT 1")
-    .get(cleanReference);
-  return rowToAiBillingEvent(row);
+  const normalized = normalizeMercadoPagoPaymentId(cleanReference);
+  const variants = [cleanReference, normalized];
+  if (/^\d+$/.test(normalized)) variants.push(`${normalized}.0`);
+  for (const value of [...new Set(variants)]) {
+    const row = db
+      .prepare("SELECT * FROM ai_billing_events WHERE provider = 'mercado_pago' AND provider_reference = ? ORDER BY id DESC LIMIT 1")
+      .get(value);
+    if (row) return rowToAiBillingEvent(row);
+  }
+  return null;
 }
 
 function getAiBillingEventByPaymentId(paymentId) {
   return getAiBillingEventByProviderReference(paymentId);
+}
+
+function clampProgressPercent(value) {
+  const number = Number(value);
+  if (!Number.isFinite(number)) return 0;
+  return Math.min(100, Math.max(0, Math.round(number)));
+}
+
+function buildAiBillingProgress(progress = {}, defaults = {}) {
+  const rawTotal = Number(progress.total ?? defaults.total ?? 0);
+  const total = Number.isFinite(rawTotal) ? Math.max(0, Math.round(rawTotal)) : 0;
+  const rawProcessed = Number(progress.processed ?? defaults.processed ?? 0);
+  const processed = Number.isFinite(rawProcessed)
+    ? Math.min(total || Math.max(0, Math.round(rawProcessed)), Math.max(0, Math.round(rawProcessed)))
+    : 0;
+  const percent = total > 0
+    ? clampProgressPercent((processed / total) * 100)
+    : clampProgressPercent(progress.percent ?? defaults.percent ?? (progress.status === "completed" ? 100 : 0));
+
+  return {
+    status: progress.status || defaults.status || "waiting",
+    total,
+    processed,
+    percent,
+    message: progress.message || defaults.message || null,
+    current_item: progress.current_item ?? defaults.current_item ?? null,
+    started_at: progress.started_at || defaults.started_at || null,
+    updated_at: progress.updated_at || defaults.updated_at || null,
+    completed_at: progress.completed_at || defaults.completed_at || null
+  };
+}
+
+function updateBillingAiProgress(eventId, patch = {}) {
+  const event = getAiBillingEvent(eventId);
+  if (!event) return null;
+  const metadata = event.metadata || {};
+  const previousProgress = metadata.ai_progress || {};
+  const nextProgress = buildAiBillingProgress(
+    {
+      ...previousProgress,
+      ...patch,
+      updated_at: now()
+    },
+    {
+      total: event.quantity || 1,
+      processed: 0,
+      status: "processing"
+    }
+  );
+  db.prepare("UPDATE ai_billing_events SET metadata_json = ?, updated_at = ? WHERE id = ?").run(
+    asJson({ ...metadata, ai_progress: nextProgress }),
+    now(),
+    event.id
+  );
+  return nextProgress;
 }
 
 function getAiBillingEventFromPaymentPayload(paymentPayload = {}) {
@@ -2179,7 +2246,7 @@ function getAiBillingEventFromPaymentPayload(paymentPayload = {}) {
 
   const references = new Set(
     [paymentPayload.id, paymentPayload.external_reference]
-      .map((value) => String(value || "").trim())
+      .map((value) => normalizeMercadoPagoPaymentId(value))
       .filter(Boolean)
   );
   if (!references.size) return null;
@@ -2191,7 +2258,7 @@ function getAiBillingEventFromPaymentPayload(paymentPayload = {}) {
     const event = rowToAiBillingEvent(row);
     const payment = event?.metadata?.payment || {};
     const eventReferences = [payment.payment_id, payment.external_reference, payment.id, event.provider_reference]
-      .map((value) => String(value || "").trim())
+      .map((value) => normalizeMercadoPagoPaymentId(value))
       .filter(Boolean);
     if (eventReferences.some((reference) => references.has(reference))) return event;
   }
@@ -2205,6 +2272,22 @@ function publicBillingFromEvent(event, overrides = {}) {
   const paid = paymentStatus === "approved" || overrides.status === "paid" || event?.status === "paid";
   const publicStatus = paid && event?.status === "processing_ai" ? "processing_ai" : paid ? "paid" : overrides.status || event?.status || "pending";
   const aiError = metadata?.ai_processing_error?.message || null;
+  const quantity = Number(event?.quantity || overrides.quantity || 1);
+  const progress = buildAiBillingProgress(metadata?.ai_progress || {}, {
+    total: quantity,
+    processed: metadata?.ai_processed_at ? quantity : 0,
+    percent: metadata?.ai_processed_at ? 100 : 0,
+    status: aiError ? "error" : metadata?.ai_processed_at ? "completed" : metadata?.ai_processing_started_at ? "processing" : paid ? "paid" : "waiting",
+    message: aiError
+      ? `Falha na auto classificacao: ${aiError}`
+      : metadata?.ai_processed_at
+        ? "Completo."
+        : metadata?.ai_processing_started_at
+          ? "Auto classificacao em andamento. Nao feche o navegador."
+          : paid
+            ? "Pagamento confirmado. Iniciando auto classificacao."
+            : "Aguardando pagamento."
+  });
   return {
     enabled: true,
     event_id: event?.id || overrides.event_id || null,
@@ -2216,9 +2299,13 @@ function publicBillingFromEvent(event, overrides = {}) {
     ai_processing: Boolean(metadata?.ai_processing_started_at && !metadata?.ai_processed_at),
     ai_processed: Boolean(metadata?.ai_processed_at),
     ai_error: aiError,
-    quantity: Number(event?.quantity || overrides.quantity || 1),
+    quantity,
     amount_cents: Number(event?.amount_cents || overrides.amount_cents || 0),
     amount_brl: moneyFromCents(event?.amount_cents || overrides.amount_cents || 0),
+    progress,
+    progress_percent: progress.percent,
+    progress_processed: progress.processed,
+    progress_total: progress.total,
     payment_id: overrides.payment_id || payment.payment_id || event?.provider_reference || null,
     payment_status: paymentStatus,
     status_detail: overrides.status_detail || payment.status_detail || null,
@@ -2276,7 +2363,8 @@ async function refreshMercadoPagoBillingEvent(event) {
     error.status = 422;
     throw error;
   }
-  const paymentId = event.provider_reference || event.metadata?.payment?.payment_id;
+  const paymentId = normalizeMercadoPagoPaymentId(event.metadata?.payment?.payment_id || event.provider_reference);
+  if (!/^\d+$/.test(paymentId)) return publicBillingFromEvent(event);
   if (!paymentId) return publicBillingFromEvent(event);
 
   const response = await fetch(`${MERCADO_PAGO_API_URL}/v1/payments/${paymentId}`, {
@@ -2297,7 +2385,7 @@ async function refreshMercadoPagoBillingEvent(event) {
   const transactionData = payload.point_of_interaction?.transaction_data || {};
   const nextPayment = {
     ...(metadata.payment || {}),
-    payment_id: payload.id || paymentId,
+    payment_id: normalizeMercadoPagoPaymentId(payload.id || paymentId),
     payment_status: payload.status || "pending",
     status_detail: payload.status_detail || null,
     qr_code_base64: transactionData.qr_code_base64 || metadata.payment?.qr_code_base64 || null,
@@ -2322,7 +2410,8 @@ async function fetchMercadoPagoPaymentById(paymentId) {
     error.status = 422;
     throw error;
   }
-  const response = await fetch(`${MERCADO_PAGO_API_URL}/v1/payments/${encodeURIComponent(paymentId)}`, {
+  const cleanPaymentId = normalizeMercadoPagoPaymentId(paymentId);
+  const response = await fetch(`${MERCADO_PAGO_API_URL}/v1/payments/${encodeURIComponent(cleanPaymentId)}`, {
     headers: {
       Authorization: `Bearer ${MERCADO_PAGO_ACCESS_TOKEN}`,
       "Content-Type": "application/json"
@@ -2343,7 +2432,7 @@ function updateBillingEventWithPaymentPayload(event, paymentPayload = {}) {
   const transactionData = paymentPayload.point_of_interaction?.transaction_data || {};
   const nextPayment = {
     ...(metadata.payment || {}),
-    payment_id: paymentPayload.id || event.provider_reference,
+    payment_id: normalizeMercadoPagoPaymentId(paymentPayload.id || event.provider_reference),
     payment_status: paymentPayload.status || "pending",
     status_detail: paymentPayload.status_detail || null,
     qr_code_base64: transactionData.qr_code_base64 || metadata.payment?.qr_code_base64 || null,
@@ -3467,7 +3556,25 @@ async function checkReviewTableAiNcm(options = {}, actor = "contador") {
   const items = [];
   const counts = {};
   let applied = 0;
-  for (const row of billableRows) {
+  if (billing?.event_id) {
+    updateBillingAiProgress(billing.event_id, {
+      total: billableRows.length,
+      processed: 0,
+      percent: 0,
+      status: "processing",
+      message: "Auto classificacao em andamento. Nao feche o navegador."
+    });
+  }
+  for (const [index, row] of billableRows.entries()) {
+    if (billing?.event_id) {
+      updateBillingAiProgress(billing.event_id, {
+        total: billableRows.length,
+        processed: index,
+        status: "processing",
+        current_item: { id: row.id },
+        message: "Auto classificacao em andamento. Nao feche o navegador."
+      });
+    }
     const updated = await checkClassificationAiNcm(row.id, { ...options, skip_billing: true, billing }, actor);
     if (!updated) continue;
     const check = updated.sugestao?.ai_ncm;
@@ -3475,6 +3582,18 @@ async function checkReviewTableAiNcm(options = {}, actor = "contador") {
     counts[status] = (counts[status] || 0) + 1;
     if (check?.result?.eligible_to_apply) applied += 1;
     items.push(updated);
+    if (billing?.event_id) {
+      updateBillingAiProgress(billing.event_id, {
+        total: billableRows.length,
+        processed: items.length,
+        status: "processing",
+        current_item: {
+          id: updated.id,
+          descricao: updated.descricao_original
+        },
+        message: "Auto classificacao em andamento. Nao feche o navegador."
+      });
+    }
   }
   const unpaidItems = Math.max(0, rows.length - billableRows.length);
   logAudit("review_table", null, "openai_ncm_check_all", actor, { total: rows.length }, { total: items.length, applied, counts, unpaidItems });
@@ -3501,7 +3620,24 @@ function markBillingAiProcessing(event) {
   if (processingFresh) return { process: false, reason: "already_processing" };
 
   db.prepare("UPDATE ai_billing_events SET status = 'processing_ai', metadata_json = ?, updated_at = ? WHERE id = ?").run(
-    asJson({ ...metadata, ai_processing_started_at: now(), ai_processing_error: null }),
+    asJson({
+      ...metadata,
+      ai_processing_started_at: now(),
+      ai_processing_error: null,
+      ai_progress: buildAiBillingProgress(
+        {
+          ...(metadata.ai_progress || {}),
+          total: current.quantity || 1,
+          processed: 0,
+          percent: 0,
+          status: "processing",
+          message: "Auto classificacao iniciada. Nao feche o navegador.",
+          started_at: metadata.ai_progress?.started_at || now(),
+          updated_at: now()
+        },
+        { total: current.quantity || 1 }
+      )
+    }),
     now(),
     current.id
   );
@@ -3512,17 +3648,34 @@ function markBillingAiProcessed(eventId, result) {
   const event = getAiBillingEvent(eventId);
   if (!event) return;
   const metadata = event.metadata || {};
+  const checked = result?.checked ?? (result?.item ? 1 : 0);
+  const paidItems = result?.paid_items ?? null;
+  const total = paidItems || checked || event.quantity || metadata.ai_progress?.total || 1;
+  const applied = result?.applied ?? (result?.item?.sugestao?.ai_ncm?.result?.eligible_to_apply ? 1 : 0);
   db.prepare("UPDATE ai_billing_events SET status = 'paid', metadata_json = ?, updated_at = ? WHERE id = ?").run(
     asJson({
       ...metadata,
       ai_processed_at: now(),
       ai_processing_started_at: null,
       ai_processing_error: null,
+      ai_progress: buildAiBillingProgress(
+        {
+          ...(metadata.ai_progress || {}),
+          total,
+          processed: total,
+          percent: 100,
+          status: "completed",
+          message: "Completo.",
+          completed_at: now(),
+          updated_at: now()
+        },
+        { total, processed: total, percent: 100, status: "completed" }
+      ),
       ai_result_summary: {
-        checked: result?.checked || (result?.item ? 1 : 0),
-        applied: result?.applied || (result?.item?.sugestao?.ai_ncm?.result?.eligible_to_apply ? 1 : 0),
-        paid_items: result?.paid_items || null,
-        unpaid_items: result?.unpaid_items || null
+        checked,
+        applied,
+        paid_items: paidItems,
+        unpaid_items: result?.unpaid_items ?? null
       }
     }),
     now(),
@@ -3541,7 +3694,16 @@ function markBillingAiProcessingError(eventId, error) {
       ai_processing_error: {
         message: error.message,
         at: now()
-      }
+      },
+      ai_progress: buildAiBillingProgress(
+        {
+          ...(metadata.ai_progress || {}),
+          status: "error",
+          message: `Falha na auto classificacao: ${error.message}`,
+          updated_at: now()
+        },
+        { total: event.quantity || 1, status: "error" }
+      )
     }),
     now(),
     event.id
@@ -4584,6 +4746,18 @@ async function handleRequest(req, res) {
     if (!event) return sendJson(res, 404, { error: "Cobranca nao encontrada." });
 
     let billing = publicBillingFromEvent(event);
+    if (!billing.ai_processing && !billing.ai_processed && !billing.ai_error && event.status !== "error") {
+      try {
+        billing = await refreshMercadoPagoBillingEvent(event);
+        event = getAiBillingEvent(event.id) || event;
+      } catch (error) {
+        billing = {
+          ...billing,
+          refresh_error: error.message,
+          message: `Aguardando confirmacao do Mercado Pago. Nao foi possivel atualizar agora: ${error.message}`
+        };
+      }
+    }
     if (shouldStartAiFromBillingStatus(event, billing)) {
       processPaidAiBillingEvent(event.id, "billing_status_poll").catch((error) => {
         markBillingAiProcessingError(event.id, error);
