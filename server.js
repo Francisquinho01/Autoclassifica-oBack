@@ -44,8 +44,13 @@ const OPENAI_NCM_MAX_CANDIDATES = Math.min(Math.max(Number(process.env.OPENAI_NC
 const OPENAI_NCM_TIMEOUT_MS = Math.min(Math.max(Number(process.env.OPENAI_NCM_TIMEOUT_MS || 30000), 8000), 90000);
 const OPENAI_NCM_MAX_OUTPUT_TOKENS = Math.min(Math.max(Number(process.env.OPENAI_NCM_MAX_OUTPUT_TOKENS || 4200), 600), 8000);
 const OPENAI_NCM_WEB_SEARCH_ENABLED = String(process.env.OPENAI_NCM_WEB_SEARCH_ENABLED || "true").toLowerCase() !== "false";
+const OPENAI_NCM_CONCURRENCY_INPUT = Number(process.env.OPENAI_NCM_CONCURRENCY || 3);
+const OPENAI_NCM_CONCURRENCY = Math.min(
+  Math.max(Number.isFinite(OPENAI_NCM_CONCURRENCY_INPUT) ? Math.round(OPENAI_NCM_CONCURRENCY_INPUT) : 3, 1),
+  8
+);
 const MERCADO_PAGO_ACCESS_TOKEN = process.env.MERCADO_PAGO_ACCESS_TOKEN || "";
-const AI_BILLING_PRICE_CENTS = Math.min(Math.max(Number(process.env.AI_BILLING_PRICE_CENTS || 10), 1), 100000);
+const AI_BILLING_PRICE_CENTS = Math.min(Math.max(Number(process.env.AI_BILLING_PRICE_CENTS || 15), 1), 100000);
 const AI_BILLING_DEFAULT_ENABLED = true;
 const AI_BILLING_TRUST_PAYMENT_UPDATED_WEBHOOK =
   String(process.env.AI_BILLING_TRUST_PAYMENT_UPDATED_WEBHOOK || "true").toLowerCase() !== "false";
@@ -1985,6 +1990,7 @@ function aiNcmConfig() {
     apply_threshold: OPENAI_NCM_APPLY_THRESHOLD,
     max_candidates: OPENAI_NCM_MAX_CANDIDATES,
     max_output_tokens: OPENAI_NCM_MAX_OUTPUT_TOKENS,
+    concurrency: OPENAI_NCM_CONCURRENCY,
     api_url: OPENAI_NCM_API_URL.replace(/\/v1\/responses.*/, "/v1/responses"),
     web_search_enabled: OPENAI_NCM_WEB_SEARCH_ENABLED,
     key_hint: OPENAI_API_KEY ? `${OPENAI_API_KEY.slice(0, 7)}...${OPENAI_API_KEY.slice(-4)}` : null,
@@ -2241,6 +2247,12 @@ function clampProgressPercent(value) {
   return Math.min(100, Math.max(0, Math.round(number)));
 }
 
+function normalizeAiNcmConcurrency(value = OPENAI_NCM_CONCURRENCY) {
+  const number = Number(value);
+  if (!Number.isFinite(number)) return OPENAI_NCM_CONCURRENCY;
+  return Math.min(8, Math.max(1, Math.round(number)));
+}
+
 function buildAiBillingProgress(progress = {}, defaults = {}) {
   const rawTotal = Number(progress.total ?? defaults.total ?? 0);
   const total = Number.isFinite(rawTotal) ? Math.max(0, Math.round(rawTotal)) : 0;
@@ -2251,14 +2263,28 @@ function buildAiBillingProgress(progress = {}, defaults = {}) {
   const percent = total > 0
     ? clampProgressPercent((processed / total) * 100)
     : clampProgressPercent(progress.percent ?? defaults.percent ?? (progress.status === "completed" ? 100 : 0));
+  const concurrency = normalizeAiNcmConcurrency(progress.concurrency ?? defaults.concurrency ?? OPENAI_NCM_CONCURRENCY);
+  const rawActiveWorkers = Number(progress.active_workers ?? defaults.active_workers ?? 0);
+  const activeWorkers = Number.isFinite(rawActiveWorkers) ? Math.min(concurrency, Math.max(0, Math.round(rawActiveWorkers))) : 0;
+  const rawFailed = Number(progress.failed ?? defaults.failed ?? 0);
+  const failed = Number.isFinite(rawFailed) ? Math.max(0, Math.round(rawFailed)) : 0;
+  const runningItems = Array.isArray(progress.running_items)
+    ? progress.running_items.slice(0, concurrency)
+    : Array.isArray(defaults.running_items)
+      ? defaults.running_items.slice(0, concurrency)
+      : [];
 
   return {
     status: progress.status || defaults.status || "waiting",
     total,
     processed,
     percent,
+    concurrency,
+    active_workers: activeWorkers,
+    failed,
     message: progress.message || defaults.message || null,
     current_item: progress.current_item ?? defaults.current_item ?? null,
+    running_items: runningItems,
     started_at: progress.started_at || defaults.started_at || null,
     updated_at: progress.updated_at || defaults.updated_at || null,
     completed_at: progress.completed_at || defaults.completed_at || null
@@ -4670,6 +4696,24 @@ async function checkClassificationAiNcm(id, options = {}, actor = "contador") {
   return updateClassificationAiNcm(id, check, options, actor);
 }
 
+async function runWithConcurrency(items, concurrency, worker) {
+  if (!items.length) return [];
+  const workerCount = Math.min(normalizeAiNcmConcurrency(concurrency), items.length);
+  const results = new Array(items.length);
+  let nextIndex = 0;
+
+  async function runWorker(workerId) {
+    while (nextIndex < items.length) {
+      const index = nextIndex;
+      nextIndex += 1;
+      results[index] = await worker(items[index], index, workerId);
+    }
+  }
+
+  await Promise.all(Array.from({ length: workerCount }, (_, index) => runWorker(index + 1)));
+  return results;
+}
+
 async function checkReviewTableAiNcm(options = {}, actor = "contador") {
   assertOpenAiConfigured();
   const limit = Math.min(Math.max(Number(options.limit || 100), 1), 500);
@@ -4691,47 +4735,88 @@ async function checkReviewTableAiNcm(options = {}, actor = "contador") {
   }
   const paidQuantity = billing?.enabled ? Math.max(0, Number(billing.quantity || 0)) : rows.length;
   const billableRows = billing?.enabled ? rows.slice(0, paidQuantity) : rows;
-  const items = [];
-  const counts = {};
-  let applied = 0;
-  if (billing?.event_id) {
-    updateBillingAiProgress(billing.event_id, {
+  const concurrency = billableRows.length
+    ? Math.min(normalizeAiNcmConcurrency(options.concurrency ?? OPENAI_NCM_CONCURRENCY), billableRows.length)
+    : 0;
+  const progressMessage = concurrency > 1
+    ? `Auto classificacao em andamento (${concurrency} produtos por vez). Nao feche o navegador.`
+    : "Auto classificacao em andamento. Nao feche o navegador.";
+  let processed = 0;
+  let failed = 0;
+  const runningItems = new Map();
+
+  function publishProgress(patch = {}) {
+    if (!billing?.event_id) return null;
+    return updateBillingAiProgress(billing.event_id, {
       total: billableRows.length,
+      processed,
+      status: "processing",
+      concurrency: concurrency || 1,
+      active_workers: runningItems.size,
+      running_items: Array.from(runningItems.values()),
+      failed,
+      message: progressMessage,
+      ...patch
+    });
+  }
+
+  if (billing?.event_id) {
+    publishProgress({
       processed: 0,
       percent: 0,
       status: "processing",
-      message: "Auto classificacao em andamento. Nao feche o navegador."
+      started_at: now()
     });
   }
-  for (const [index, row] of billableRows.entries()) {
-    if (billing?.event_id) {
-      updateBillingAiProgress(billing.event_id, {
-        total: billableRows.length,
-        processed: index,
-        status: "processing",
-        current_item: { id: row.id },
-        message: "Auto classificacao em andamento. Nao feche o navegador."
-      });
+
+  const results = await runWithConcurrency(billableRows, concurrency || 1, async (row, index, workerId) => {
+    const currentItem = { id: row.id, position: index + 1 };
+    runningItems.set(workerId, currentItem);
+    publishProgress({ current_item: currentItem });
+
+    try {
+      const updated = await checkClassificationAiNcm(row.id, { ...options, skip_billing: true, billing }, actor);
+      return updated ? { updated } : null;
+    } catch (error) {
+      failed += 1;
+      logAudit(
+        "classification",
+        row.id,
+        "openai_ncm_error",
+        actor,
+        { id: row.id },
+        { error: error.message },
+        { source_table: "openai", effective_date: now().slice(0, 10) }
+      );
+      return { error: error.message, row_id: row.id };
+    } finally {
+      processed += 1;
+      runningItems.delete(workerId);
+      publishProgress({ processed, current_item: currentItem });
     }
-    const updated = await checkClassificationAiNcm(row.id, { ...options, skip_billing: true, billing }, actor);
+  });
+
+  const items = [];
+  const counts = {};
+  let applied = 0;
+  for (const result of results) {
+    if (result?.error) {
+      counts.error = (counts.error || 0) + 1;
+      continue;
+    }
+    const updated = result?.updated;
     if (!updated) continue;
     const check = updated.sugestao?.ai_ncm;
     const status = check?.result?.status || "unknown";
     counts[status] = (counts[status] || 0) + 1;
     if (check?.result?.eligible_to_apply) applied += 1;
     items.push(updated);
-    if (billing?.event_id) {
-      updateBillingAiProgress(billing.event_id, {
-        total: billableRows.length,
-        processed: items.length,
-        status: "processing",
-        current_item: {
-          id: updated.id,
-          descricao: updated.descricao_original
-        },
-        message: "Auto classificacao em andamento. Nao feche o navegador."
-      });
-    }
+  }
+
+  if (failed && !items.length && billableRows.length) {
+    const error = new Error(`Nao foi possivel auto classificar nenhum item. ${failed} produto(s) falharam durante a consulta.`);
+    error.status = 502;
+    throw error;
   }
   const unpaidItems = Math.max(0, rows.length - billableRows.length);
   logAudit("review_table", null, "openai_ncm_check_all", actor, { total: rows.length }, { total: items.length, applied, counts, unpaidItems });
@@ -4739,10 +4824,12 @@ async function checkReviewTableAiNcm(options = {}, actor = "contador") {
     checked: items.length,
     applied,
     counts,
+    failed,
+    concurrency: concurrency || 1,
     paid_items: billableRows.length,
     unpaid_items: unpaidItems,
     openai: aiNcmConfig(),
-    billing,
+    billing: billing?.event_id ? publicBillingFromEvent(getAiBillingEvent(billing.event_id)) : billing,
     items
   };
 }
@@ -4769,6 +4856,9 @@ function markBillingAiProcessing(event) {
           processed: 0,
           percent: 0,
           status: "processing",
+          concurrency: OPENAI_NCM_CONCURRENCY,
+          active_workers: 0,
+          failed: 0,
           message: "Auto classificacao iniciada. Nao feche o navegador.",
           started_at: metadata.ai_progress?.started_at || now(),
           updated_at: now()
@@ -4790,6 +4880,7 @@ function markBillingAiProcessed(eventId, result) {
   const paidItems = result?.paid_items ?? null;
   const total = paidItems || checked || event.quantity || metadata.ai_progress?.total || 1;
   const applied = result?.applied ?? (result?.item?.sugestao?.ai_ncm?.result?.eligible_to_apply ? 1 : 0);
+  const failed = result?.failed ?? metadata.ai_progress?.failed ?? 0;
   db.prepare("UPDATE ai_billing_events SET status = 'paid', metadata_json = ?, updated_at = ? WHERE id = ?").run(
     asJson({
       ...metadata,
@@ -4803,6 +4894,7 @@ function markBillingAiProcessed(eventId, result) {
           processed: total,
           percent: 100,
           status: "completed",
+          failed,
           message: "Completo.",
           completed_at: now(),
           updated_at: now()
@@ -4812,6 +4904,7 @@ function markBillingAiProcessed(eventId, result) {
       ai_result_summary: {
         checked,
         applied,
+        failed,
         paid_items: paidItems,
         unpaid_items: result?.unpaid_items ?? null
       }
