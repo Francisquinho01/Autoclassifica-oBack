@@ -40,7 +40,6 @@ const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
 const OPENAI_NCM_MODEL = process.env.OPENAI_NCM_MODEL || "gpt-5-mini";
 const OPENAI_NCM_API_URL = process.env.OPENAI_NCM_API_URL || "https://api.openai.com/v1/responses";
 const OPENAI_NCM_APPLY_THRESHOLD = Math.min(Math.max(Number(process.env.OPENAI_NCM_APPLY_THRESHOLD || 0.9), 0.9), 0.99);
-const OPENAI_NCM_MAX_CANDIDATES = Math.min(Math.max(Number(process.env.OPENAI_NCM_MAX_CANDIDATES || 8), 3), 15);
 const OPENAI_NCM_TIMEOUT_MS = Math.min(Math.max(Number(process.env.OPENAI_NCM_TIMEOUT_MS || 30000), 8000), 90000);
 const OPENAI_NCM_MAX_OUTPUT_TOKENS = Math.min(Math.max(Number(process.env.OPENAI_NCM_MAX_OUTPUT_TOKENS || 1800), 800), 3500);
 const OPENAI_NCM_WEB_SEARCH_ENABLED = String(process.env.OPENAI_NCM_WEB_SEARCH_ENABLED || "true").toLowerCase() !== "false";
@@ -49,7 +48,6 @@ const OPENAI_NCM_CONCURRENCY = Math.min(
   Math.max(Number.isFinite(OPENAI_NCM_CONCURRENCY_INPUT) ? Math.round(OPENAI_NCM_CONCURRENCY_INPUT) : 10, 1),
   10
 );
-const AI_LEARNING_ENABLED = false;
 const MERCADO_PAGO_ACCESS_TOKEN = process.env.MERCADO_PAGO_ACCESS_TOKEN || "";
 const AI_BILLING_PRICE_CENTS = Math.min(Math.max(Number(process.env.AI_BILLING_PRICE_CENTS || 15), 1), 100000);
 const AI_BILLING_DEFAULT_ENABLED = true;
@@ -1228,11 +1226,6 @@ function isGenericHitTerm(term) {
   ].includes(normalized);
 }
 
-function shouldAskForSpecification(tokens, row, hits) {
-  const meaningfulHits = new Set(hits.map((hit) => normalizeText(hit)).filter((hit) => !isGenericHitTerm(hit)));
-  return tokens.length <= 1 && isGenericNcmRow(row) && meaningfulHits.size > 0 && meaningfulHits.size <= 1;
-}
-
 function primaryProductToken(tokens = []) {
   return tokens.find((token) => !isGenericHitTerm(token)) || tokens[0] || "";
 }
@@ -1699,10 +1692,8 @@ function scoreNcmCandidate(row, tokens, rawQuery = "") {
   const descriptionBonus = descriptionExactHit ? 0.24 : descriptionPrefixHit ? 0.14 : 0;
   const codeBonus = rawDigits.length >= 4 && row.codigo.includes(rawDigits) ? 0.5 : 0;
   const phraseBonus = Math.min(0.3, phraseHits.length * 0.15);
-  const generic = shouldAskForSpecification(tokens, row, [...meaningfulHits.map((hit) => hit.term), ...phraseHits]);
   const curatedGeneric = isCuratedGenericNcmRow(keywords);
   const curatedSource = ["seed_mvp", "siscomex_json_curated"].includes(row.source);
-  const genericBonus = generic ? (curatedGeneric ? 0.18 : 0.04) : 0;
   const curatedSourceBonus = curatedSource ? 0.08 : 0;
   const primaryBonus = primaryHit ? 0.18 : 0;
   const missingPrimaryPenalty = primaryToken && !primaryHit && tokens.length > 1 ? 0.35 : 0;
@@ -1719,7 +1710,6 @@ function scoreNcmCandidate(row, tokens, rawQuery = "") {
           descriptionBonus +
           codeBonus +
           phraseBonus +
-          genericBonus +
           curatedSourceBonus +
           primaryBonus -
           missingPrimaryPenalty
@@ -1736,11 +1726,7 @@ function scoreNcmCandidate(row, tokens, rawQuery = "") {
     description_exact_hit: descriptionExactHit,
     description_prefix_hit: descriptionPrefixHit,
     curated_source: curatedSource,
-    curated_generic: curatedGeneric,
-    needs_specification: generic,
-    specification_message: generic
-      ? `Produto genérico encontrado em ${row.descricao}. Deseja especificar melhor? Exemplo: Queijo Minas, camarao de agua fria.`
-      : null
+    curated_generic: curatedGeneric
   };
 }
 
@@ -1775,9 +1761,7 @@ function findNcmMatch(product, tokens, options = {}) {
         description_exact_hit: scored.description_exact_hit,
         description_prefix_hit: scored.description_prefix_hit,
         curated_source: scored.curated_source,
-        curated_generic: scored.curated_generic,
-        needs_specification: scored.needs_specification,
-        specification_message: scored.specification_message
+        curated_generic: scored.curated_generic
       };
     })
     .filter((item) => item.score >= 0.45 && item.meaningful_hit_count > 0);
@@ -1799,33 +1783,6 @@ function findNcmMatch(product, tokens, options = {}) {
   };
 }
 
-function findValidatedRule(tokens, companyId = 1, operationType = "venda") {
-  if (!AI_LEARNING_ENABLED) return null;
-  const operation = normalizeOperationType(operationType);
-  const rules = db
-    .prepare(
-      `
-      SELECT *
-      FROM validated_rules
-      WHERE empresa_id = ?
-        AND COALESCE(ncm, '') != '00000000'
-        AND (tipo_operacao IS NULL OR tipo_operacao = '' OR tipo_operacao = ?)
-      ORDER BY CASE WHEN tipo_operacao = ? THEN 0 ELSE 1 END, data_validacao DESC
-    `
-    )
-    .all(companyId, operation, operation);
-  let best = null;
-  for (const rule of rules) {
-    const keywords = parseJson(rule.palavras_chave, []);
-    if (!keywords.length) continue;
-    const hits = keywords.filter((keyword) => tokens.some((token) => tokenMatchesKeyword(token, keyword)));
-    const operationBonus = rule.tipo_operacao && normalizeOperationType(rule.tipo_operacao) === operation ? 0.05 : 0;
-    const score = Math.min(1, hits.length / keywords.length + operationBonus);
-    if (!best || score > best.score) best = { ...rule, score, hits };
-  }
-  return best && best.score >= 0.55 ? best : null;
-}
-
 function scoreNcmSearchRow(row, tokens, rawQuery) {
   const scored = scoreNcmCandidate(row, tokens, rawQuery);
   return {
@@ -1841,9 +1798,7 @@ function scoreNcmSearchRow(row, tokens, rawQuery) {
     description_exact_hit: scored.description_exact_hit,
     description_prefix_hit: scored.description_prefix_hit,
     curated_source: scored.curated_source,
-    curated_generic: scored.curated_generic,
-    needs_specification: scored.needs_specification,
-    specification_message: scored.specification_message
+    curated_generic: scored.curated_generic
   };
 }
 
@@ -1859,7 +1814,6 @@ function shouldPreferNcmCandidate(scored, best) {
     if (scored.description_prefix_hit && !best.description_prefix_hit) return true;
     if (scored.curated_source && !best.curated_source) return true;
     if ((scored.meaningful_hit_count || 0) > (best.meaningful_hit_count || 0)) return true;
-    if (scored.needs_specification && !best.needs_specification) return true;
   }
   return scored.score > best.score;
 }
@@ -1873,8 +1827,6 @@ function compareDescValue(a, b) {
 function compareNcmRows(a, b, tokenCount) {
   if (tokenCount <= 1) {
     return (
-      compareDescValue(Number(a.needs_specification), Number(b.needs_specification)) ||
-      compareDescValue(Number(a.needs_specification && a.curated_generic), Number(b.needs_specification && b.curated_generic)) ||
       compareDescValue(Number(a.description_exact_hit), Number(b.description_exact_hit)) ||
       compareDescValue(Number(a.description_prefix_hit), Number(b.description_prefix_hit)) ||
       compareDescValue(Number(a.curated_source), Number(b.curated_source)) ||
@@ -1892,15 +1844,12 @@ function compareNcmRows(a, b, tokenCount) {
     compareDescValue(Number(a.curated_source), Number(b.curated_source)) ||
     compareDescValue(a.meaningful_hit_count || 0, b.meaningful_hit_count || 0) ||
     compareDescValue(a.score, b.score) ||
-    compareDescValue(Number(a.needs_specification), Number(b.needs_specification)) ||
     a.codigo.localeCompare(b.codigo)
   );
 }
 
 function ncmSearchRank(row, tokenCount) {
   return (
-    (tokenCount <= 1 && row.needs_specification ? 1000 : 0) +
-    (tokenCount <= 1 && row.needs_specification && row.curated_generic ? 100 : 0) +
     (row.primary_hit ? 220 : 0) +
     (row.phrase_hits?.length || 0) * 170 +
     (row.description_exact_hit ? 260 : 0) +
@@ -1953,12 +1902,6 @@ function searchRowsInBase({ key, label, table, fields, tokens, rawQuery, limit =
 function searchAllBases(rawQuery, tokens) {
   const definitions = [
     { key: "ncm_oficial", label: "NCM oficial", table: "ncm_oficial", fields: ["codigo", "descricao"] },
-    ...(AI_LEARNING_ENABLED ? [{
-      key: "validated_rules",
-      label: "Regras validadas pelo contador",
-      table: "validated_rules",
-      fields: ["descricao_base", "tipo_operacao", "segmento", "ncm", "cest", "cclass_trib", "aliquota_icms", "aliquota_pis", "aliquota_cofins", "aliquota_fcp"]
-    }] : []),
     { key: "cfop_oficial", label: "CFOP oficial", table: "cfop_oficial", fields: ["codigo", "descricao", "tipo", "entrada_saida"] },
     { key: "regras_cfop", label: "CFOP por operacao", table: "regras_cfop", fields: ["tipo_operacao", "uf_origem", "uf_destino", "origem_mercadoria", "cfop"] },
     { key: "origem_mercadoria", label: "Origem da mercadoria", table: "origem_mercadoria", fields: ["codigo", "descricao"] },
@@ -1986,7 +1929,7 @@ function searchFiscal(query, limit = 20) {
   const tokens = extractTokens(rawQuery);
   const rawDigits = extractSearchCode(rawQuery);
   if (!rawQuery || (tokens.length === 0 && !rawDigits)) {
-    return { query: rawQuery, ncm: [], validated_rules: [], base_results: [] };
+    return { query: rawQuery, ncm: [], base_results: [] };
   }
 
   const catalog = getNcmCandidateRows(tokens, rawQuery, 1000);
@@ -2011,8 +1954,6 @@ function searchFiscal(query, limit = 20) {
         phrase_hits: scored.phrase_hits,
         curated_source: scored.curated_source,
         curated_generic: scored.curated_generic,
-        needs_specification: scored.needs_specification,
-        specification_message: scored.specification_message,
         tabelas: getFiscalTablesForNcm(row.codigo)
       };
     })
@@ -2025,27 +1966,7 @@ function searchFiscal(query, limit = 20) {
     .sort((a, b) => ncmSearchRank(b, tokens.length) - ncmSearchRank(a, tokens.length) || a.codigo.localeCompare(b.codigo))
     .slice(0, Math.min(Number(limit || 20), 50));
 
-  const validated_rules = AI_LEARNING_ENABLED
-    ? db
-        .prepare("SELECT * FROM validated_rules ORDER BY data_validacao DESC LIMIT 300")
-        .all()
-        .map((rule) => {
-          const keywords = parseJson(rule.palavras_chave, []);
-          const hits = keywords.filter((keyword) => tokens.some((token) => tokenMatchesKeyword(token, keyword)));
-          const descriptionHit = tokens.some((token) => normalizeText(rule.descricao_base).includes(token));
-          return {
-            ...rule,
-            palavras_chave: keywords,
-            score: hits.length + (descriptionHit ? 1 : 0),
-            hits
-          };
-        })
-        .filter((rule) => rule.score > 0)
-        .sort((a, b) => b.score - a.score)
-        .slice(0, 20)
-    : [];
-
-  return { query: rawQuery, ncm, validated_rules, base_results: searchAllBases(rawQuery, tokens) };
+  return { query: rawQuery, ncm, base_results: searchAllBases(rawQuery, tokens) };
 }
 
 function normalizeNcmCode(value) {
@@ -2095,7 +2016,6 @@ function aiNcmConfig() {
     configured: Boolean(OPENAI_API_KEY),
     model: OPENAI_NCM_MODEL,
     apply_threshold: OPENAI_NCM_APPLY_THRESHOLD,
-    max_candidates: OPENAI_NCM_MAX_CANDIDATES,
     max_output_tokens: OPENAI_NCM_MAX_OUTPUT_TOKENS,
     concurrency: OPENAI_NCM_CONCURRENCY,
     api_url: OPENAI_NCM_API_URL.replace(/\/v1\/responses.*/, "/v1/responses"),
@@ -2104,10 +2024,6 @@ function aiNcmConfig() {
     billing: aiBillingConfig(),
     engine: "aikkie_fiscal_2_0",
     layers: ["produto", "empresa", "operacao"],
-    learning: {
-      enabled: AI_LEARNING_ENABLED,
-      mode: "removed"
-    },
     policy: "Web-first: o classificador pesquisa os dados fiscais do produto e aplica o retorno quando o NCM tem 8 digitos validos, sem depender de referencias locais ou aprendizado."
   };
 }
@@ -2701,23 +2617,6 @@ function formatNcm(code) {
   return `${clean.slice(0, 4)}.${clean.slice(4, 6)}.${clean.slice(6, 8)}`;
 }
 
-function buildOfficialEvidence(row, role = "candidate") {
-  if (!row?.codigo || normalizeNcmCode(row.codigo) === "00000000") return null;
-  return {
-    type: "official",
-    role,
-    title: `Tabela oficial NCM Siscomex - ${formatNcm(row.codigo)}`,
-    url: NCM_JSON_URL,
-    snippet: `${row.codigo} - ${row.descricao}`,
-    source: row.source || "ncm_oficial",
-    checked_at: now()
-  };
-}
-
-function shouldUseWebEvidence(checkStatus) {
-  return ["divergent", "missing", "invalid", "uncertain", "needs_specification"].includes(checkStatus);
-}
-
 async function fetchJsonWithTimeout(url, options = {}, timeoutMs = 12000) {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), timeoutMs);
@@ -2761,7 +2660,7 @@ function buildFiscalSearchQueries(productName, uf = "") {
   };
 }
 
-async function fetchWebEvidence(productName, candidate, options = {}) {
+async function fetchWebEvidence(productName, options = {}) {
   const query = buildFiscalSearchQueries(productName, options.uf).fiscal_full;
   if (!options.useWeb) {
     return { status: "not_requested", query, items: [] };
@@ -2830,209 +2729,6 @@ async function fetchWebEvidence(productName, candidate, options = {}) {
   return { status: "not_configured", query, items: [] };
 }
 
-function strongNcmCandidate(candidate) {
-  return (
-    candidate?.codigo &&
-    candidate.codigo !== "00000000" &&
-    Number(candidate.score || 0) >= 0.68 &&
-    Number(candidate.meaningful_hit_count || 0) > 0
-  );
-}
-
-function evaluateNcmCheck({ currentCode, currentRow, currentScore, candidate }) {
-  const candidateStrong = strongNcmCandidate(candidate);
-  const candidateCode = normalizeNcmCode(candidate?.codigo);
-
-  if (candidate?.needs_specification) {
-    return {
-      status: "needs_specification",
-      severity: "warning",
-      message: candidate.specification_message || "Produto generico. Especifique melhor antes de aprovar o NCM."
-    };
-  }
-
-  if (!currentCode || currentCode === "00000000") {
-    return candidateStrong
-      ? {
-          status: "missing",
-          severity: "warning",
-          message: `Produto sem NCM. O robo encontrou ${candidateCode} na base oficial/local para revisao.`
-        }
-      : {
-          status: "uncertain",
-          severity: "warning",
-          message: "Produto sem NCM e sem semelhanca suficiente na base local."
-        };
-  }
-
-  if (!currentRow) {
-    return candidateStrong
-      ? {
-          status: "invalid",
-          severity: "danger",
-          message: `NCM atual ${currentCode} nao esta ativo na tabela oficial. Candidato local: ${candidateCode}.`
-        }
-      : {
-          status: "invalid",
-          severity: "danger",
-          message: `NCM atual ${currentCode} nao esta ativo na tabela oficial e o robo nao encontrou referencia local forte.`
-        };
-  }
-
-  if (candidateCode && candidateCode === currentCode && Number(currentScore?.score || 0) >= 0.45) {
-    return {
-      status: "ok",
-      severity: "ok",
-      message: "NCM atual bate com a melhor sugestao da base oficial/local."
-    };
-  }
-
-  if (candidateStrong && candidateCode !== currentCode) {
-    return {
-      status: "divergent",
-      severity: "danger",
-      message: `NCM atual ${currentCode} diverge da melhor sugestao local ${candidateCode}. Revisar antes de aprovar.`
-    };
-  }
-
-  return {
-    status: "uncertain",
-    severity: "warning",
-    message: "NCM existe na base oficial, mas a descricao do produto nao deu confianca suficiente."
-  };
-}
-
-function getNcmCheckCandidates(productText, limit = 5) {
-  return searchFiscal(productText, limit).ncm.map((item) => ({
-    codigo: item.codigo,
-    descricao: item.descricao,
-    score: item.score,
-    source: item.source,
-    hits: item.hits,
-    occurrence_count: item.occurrence_count,
-    meaningful_hit_count: item.meaningful_hit_count,
-    phrase_hits: item.phrase_hits,
-    curated_source: item.curated_source,
-    needs_specification: item.needs_specification,
-    specification_message: item.specification_message
-  }));
-}
-
-async function buildNcmCheck(classification, options = {}) {
-  const productText = `${classification.descricao_original || ""} ${classification.marca || ""} ${classification.categoria || ""}`.trim();
-  const tokens = extractTokens(productText);
-  const currentCode = normalizeNcmCode(classification.ncm);
-  const currentRow = getOfficialNcmRow(currentCode);
-  const currentScore = currentRow ? scoreNcmCandidate(currentRow, tokens, productText) : null;
-  const candidate = findNcmMatch({ ...classification, ncm_importado: "" }, tokens, { useImportedNcm: false });
-  const candidateRow = getOfficialNcmRow(candidate.codigo) || candidate;
-  const candidates = getNcmCheckCandidates(productText, 5);
-  const evaluation = evaluateNcmCheck({ currentCode, currentRow, currentScore, candidate });
-  const official_sources = [
-    buildOfficialEvidence(currentRow, "current"),
-    buildOfficialEvidence(candidateRow, "candidate")
-  ].filter(Boolean);
-  const useWeb = Boolean(options.use_web || options.useWeb);
-  const web = await fetchWebEvidence(productText, candidate, {
-    useWeb: useWeb && shouldUseWebEvidence(evaluation.status)
-  });
-  const confidence = Math.min(0.99, Math.max(0.18, Number(candidate.score || 0) / 1.35));
-
-  return {
-    checked_at: now(),
-    product: {
-      id: classification.product_id,
-      descricao: classification.descricao_original
-    },
-    current: {
-      codigo: currentCode || "00000000",
-      exists_in_official: Boolean(currentRow),
-      descricao: currentRow?.descricao || null,
-      source: currentRow?.source || null,
-      score: currentScore ? Number(currentScore.score.toFixed(2)) : 0,
-      hits: currentScore?.hits || []
-    },
-    candidate: {
-      ...candidate,
-      score: Number(candidate.score || 0),
-      formatted: formatNcm(candidate.codigo)
-    },
-    candidates,
-    confidence: Number(confidence.toFixed(2)),
-    status: evaluation.status,
-    severity: evaluation.severity,
-    message: evaluation.message,
-    official_sources,
-    web,
-    policy: "A evidencia web nao aprova NCM automaticamente; ela so ajuda o contador na revisao."
-  };
-}
-
-function updateClassificationNcmCheck(id, check, options = {}, actor = "contador") {
-  const previous = getClassification(id);
-  if (!previous) return null;
-  const currentSuggestion = previous.sugestao || {};
-  const nextSuggestion = { ...currentSuggestion, ncm_check: check };
-  const canApply =
-    Boolean(options.apply_suggestion || options.applySuggestion) &&
-    previous.status !== "approved" &&
-    strongNcmCandidate(check.candidate) &&
-    ["missing", "divergent", "invalid"].includes(check.status);
-  const nextNcm = canApply ? check.candidate.codigo : previous.ncm;
-  const nextConfidence = canApply ? Math.max(Number(previous.confianca || 0), check.confidence) : previous.confianca;
-  const nextStatus = previous.status === "approved" ? previous.status : "pending_review";
-  const nextObservation = canApply
-    ? `NCM sugerido pelo robo para revisao: ${check.candidate.codigo} - ${check.candidate.descricao}`
-    : previous.observacao;
-
-  db.prepare(
-    `
-    UPDATE classifications SET
-      ncm = ?, confianca = ?, status = ?, observacao = ?, sugestao_json = ?, updated_at = ?
-    WHERE id = ?
-  `
-  ).run(nextNcm, nextConfidence, nextStatus, nextObservation, asJson(nextSuggestion), now(), id);
-
-  const updated = getClassification(id);
-  logAudit("classification", id, "ncm_robot_check", actor, previous, updated, {
-    source_table: "ncm_oficial",
-    table_version: check.official_sources?.[0]?.url || NCM_JSON_URL,
-    effective_date: check.checked_at?.slice(0, 10)
-  });
-  return updated;
-}
-
-async function checkClassificationNcm(id, options = {}, actor = "contador") {
-  const previous = getClassification(id);
-  if (!previous) return null;
-  const check = await buildNcmCheck(previous, options);
-  return updateClassificationNcmCheck(id, check, options, actor);
-}
-
-async function checkReviewTableNcm(options = {}, actor = "contador") {
-  const limit = Math.min(Math.max(Number(options.limit || 500), 1), 1000);
-  const rows = db.prepare("SELECT id FROM classifications ORDER BY id LIMIT ?").all(limit);
-  const items = [];
-  const counts = {};
-  for (const row of rows) {
-    const updated = await checkClassificationNcm(row.id, options, actor);
-    if (!updated) continue;
-    const check = updated.sugestao?.ncm_check;
-    const status = check?.status || "unknown";
-    counts[status] = (counts[status] || 0) + 1;
-    items.push(updated);
-  }
-  logAudit("review_table", null, "ncm_robot_check_all", actor, { total: rows.length }, { total: items.length, counts });
-  return {
-    checked: items.length,
-    counts,
-    use_web: Boolean(options.use_web || options.useWeb),
-    apply_suggestion: Boolean(options.apply_suggestion || options.applySuggestion),
-    web: ncmRobotConfig().web_evidence,
-    items
-  };
-}
-
 const AI_NCM_SCHEMA = {
   type: "object",
   additionalProperties: false,
@@ -3040,13 +2736,10 @@ const AI_NCM_SCHEMA = {
     "request_id",
     "sku",
     "descricao_original",
-    "caracteristicas_explicitas",
     "ncm",
     "confianca_ncm",
     "cest_possivel",
     "confianca_cest",
-    "especificacao_suficiente",
-    "faltando",
     "dados_fiscais",
     "justificativa_curta",
     "status",
@@ -3057,48 +2750,10 @@ const AI_NCM_SCHEMA = {
     request_id: { type: "string" },
     sku: { type: "string" },
     descricao_original: { type: "string" },
-    caracteristicas_explicitas: {
-      type: "object",
-      additionalProperties: false,
-      required: [
-        "produto",
-        "marca",
-        "composicao",
-        "material",
-        "finalidade",
-        "embalagem",
-        "volume",
-        "unidade",
-        "dimensao",
-        "apresentacao",
-        "funcao_principal",
-        "funcionamento",
-        "uso",
-        "outras"
-      ],
-      properties: {
-        produto: { type: "string" },
-        marca: { type: "string" },
-        composicao: { type: "string" },
-        material: { type: "string" },
-        finalidade: { type: "string" },
-        embalagem: { type: "string" },
-        volume: { type: "string" },
-        unidade: { type: "string" },
-        dimensao: { type: "string" },
-        apresentacao: { type: "string" },
-        funcao_principal: { type: "string" },
-        funcionamento: { type: "string" },
-        uso: { type: "string" },
-        outras: { type: "array", items: { type: "string" } }
-      }
-    },
     ncm: { type: "string" },
     confianca_ncm: { type: "number" },
     cest_possivel: { type: "string" },
     confianca_cest: { type: "number" },
-    especificacao_suficiente: { type: "boolean" },
-    faltando: { type: "array", items: { type: "string" } },
     dados_fiscais: {
       type: "object",
       additionalProperties: false,
@@ -3170,7 +2825,7 @@ const AI_NCM_SCHEMA = {
     justificativa_curta: { type: "string" },
     status: {
       type: "string",
-      enum: ["CLASSIFICADO", "REVISAO_ESPECIFICACAO", "ERRO_BASE_FISCAL", "ERRO_OPENAI", "ERRO_VALIDACAO"]
+      enum: ["CLASSIFICADO", "REVISAO_MANUAL", "ERRO_BASE_FISCAL", "ERRO_OPENAI", "ERRO_VALIDACAO"]
     },
     fontes: {
       type: "array",
@@ -3203,9 +2858,9 @@ function aiNcmInstructions() {
     "Voce e o classificador fiscal web-first da Aikkie para produtos vendidos no Brasil.",
     "Cada requisicao e independente. Use request_id e sku recebidos no contexto e devolva exatamente os mesmos valores; nao use memoria, conversa anterior, produto anterior ou inferencia de outro item.",
     "Pesquise na web usando search_queries.fiscal_full e consultas equivalentes ao estilo: '<descricao do produto> ncm UF <UF> SKU EAN GTIN Descricao NCM CEST Unidade Origem CFOP CST ICMS CSOSN aliquota ICMS ICMS-ST FCP PIS COFINS IPI EX TIPI cEnq IBS CBS cClassTrib cBenef vTotTrib'.",
-    "Use o resultado web mais direto encontrado, inclusive resumos/visoes gerais quando aparecerem, e extraia os codigos/campos fiscais retornados para dados_fiscais.",
-    "As referencias locais em ncm_policy.allowed_ncms sao apenas apoio. Nao bloqueie um NCM pesquisado na web so porque ele nao apareceu nas referencias locais.",
-    "Se a descricao for generica, classifique pelo entendimento comercial comum retornado pela busca web. So use REVISAO_ESPECIFICACAO quando a web deixar claro que existem alternativas fiscais incompatíveis e impossiveis de decidir.",
+    "Use o resultado web mais direto encontrado, priorizando o bloco 'Visao geral criada por IA' do Google quando aparecer, e extraia os codigos/campos fiscais retornados para dados_fiscais.",
+    "Nao use candidatos locais, ocorrencias, regras antigas, memoria ou aprendizado para escolher o resultado; a pesquisa web desta requisicao define a resposta.",
+    "Use a descricao recebida como verdade de entrada. Nao interrompa o fluxo e nao deixe pendente por descricao generica; pesquise e classifique pelo retorno web mais direto.",
     "Preencha todos os campos de dados_fiscais. Quando a web disser que nao possui CEST/cBenef/EX TIPI obrigatorio, use 'SEM CEST OBRIGATORIO', 'SEM CBENEF' ou string vazia conforme o campo.",
     "Nao invente EAN/GTIN. Se a fonte mostrar EAN generico, exemplo, 7890000000000, 0000000000000 ou placeholder, retorne ean_gtin vazio.",
     "Para CFOP, use operation.cfop_interno_default e operation.cfop_interestadual_default quando a busca nao trouxer valor melhor.",
@@ -3216,122 +2871,6 @@ function aiNcmInstructions() {
     "A justificativa_curta deve ser curta, objetiva e baseada no que a busca retornou. Nada de resposta longa.",
     "Retorne apenas JSON no formato do schema."
   ].join(" ");
-}
-
-function compactAiCandidate(candidate) {
-  return {
-    codigo: candidate.codigo,
-    descricao: candidate.descricao,
-    score: Number(candidate.score || 0),
-    source: candidate.source || "ncm_oficial",
-    hits: candidate.hits || [],
-    phrase_hits: candidate.phrase_hits || [],
-    curated: Boolean(candidate.curated_source),
-    needs_specification: Boolean(candidate.needs_specification),
-    specification_message: candidate.specification_message || null
-  };
-}
-
-function compactValidatedRule(rule) {
-  return {
-    id: rule.id,
-    descricao_base: rule.descricao_base,
-    tipo_operacao: rule.tipo_operacao || "",
-    ncm: rule.ncm,
-    cest: rule.cest,
-    csosn: rule.csosn,
-    cst_icms: rule.cst_icms,
-    aliquota_icms: rule.aliquota_icms,
-    aliquota_pis: rule.aliquota_pis,
-    aliquota_cofins: rule.aliquota_cofins,
-    aliquota_fcp: rule.aliquota_fcp,
-    score: rule.score,
-    hits: rule.hits || []
-  };
-}
-
-function compactAiBaseResults(baseResults = []) {
-  return baseResults.slice(0, 8).map((base) => ({
-    key: base.key,
-    label: base.label,
-    count: base.count,
-    items: (base.items || []).slice(0, 3).map((item) => {
-      const compact = {};
-      for (const [key, value] of Object.entries(item)) {
-        if (
-          [
-            "score",
-            "hits",
-            "codigo",
-            "codigo_cest",
-            "ncm",
-            "descricao",
-            "segmento",
-            "tipo_incidencia",
-            "csosn",
-            "cst_icms",
-            "aliquota_icms",
-            "aliquota_pis",
-            "aliquota_cofins",
-            "aliquota_fcp"
-          ].includes(key)
-        ) {
-          compact[key] = value;
-        }
-      }
-      return compact;
-    })
-  }));
-}
-
-function compactFiscalTableRows(rows = [], fields = []) {
-  return rows.slice(0, 5).map((row) => {
-    const compact = {};
-    for (const field of fields) compact[field] = row[field] ?? "";
-    return compact;
-  });
-}
-
-function compactFiscalTablesForAi(tables = {}, uf = "") {
-  const fiscalUf = normalizeUf(uf, "");
-  const cbenefRows = fiscalUf
-    ? (tables.cbenef || []).filter((row) => row.uf === fiscalUf || row.uf === "*" || !row.uf)
-    : tables.cbenef;
-  return {
-    cest: compactFiscalTableRows(tables.cest, ["codigo_cest", "ncm", "descricao", "segmento"]),
-    tipi: compactFiscalTableRows(tables.tipi, ["ncm", "aliquota_ipi", "ex_tipi", "descricao", "vigencia"]),
-    pis_cofins: compactFiscalTableRows(tables.pis_cofins, ["ncm", "aliquota_pis", "aliquota_cofins", "tipo_incidencia"]),
-    cbenef: compactFiscalTableRows(cbenefRows, ["uf", "codigo_beneficio", "descricao", "cst"]),
-    ibs_cbs_cst: compactFiscalTableRows(tables.ibs_cbs_cst, ["codigo", "descricao"]),
-    ibs_cbs_classificacao: compactFiscalTableRows(tables.ibs_cbs_classificacao, ["cclass_trib", "descricao", "cst_permitido"])
-  };
-}
-
-function getNcmCatalogMetadata() {
-  const row = db
-    .prepare(
-      `
-      SELECT
-        COUNT(*) AS total,
-        SUM(CASE WHEN ativo = 1 THEN 1 ELSE 0 END) AS ativos,
-        MAX(data_inicio) AS ultima_data_inicio,
-        MAX(source) AS source
-      FROM ncm_oficial
-    `
-    )
-    .get();
-  const lastSync = db
-    .prepare("SELECT created_at FROM audit_logs WHERE entity_type = 'catalog' AND action = 'sync_ncm' ORDER BY id DESC LIMIT 1")
-    .get();
-  return {
-    source: NCM_JSON_URL,
-    source_table: row?.source || "ncm_oficial",
-    total_rows: Number(row?.total || 0),
-    active_rows: Number(row?.ativos || 0),
-    latest_start_date: row?.ultima_data_inicio || "",
-    last_sync_at: lastSync?.created_at || "",
-    checked_at: now()
-  };
 }
 
 function buildAiRequestId(classification = {}) {
@@ -3346,26 +2885,17 @@ async function buildAiNcmContext(classification, options = {}) {
   const searchQueries = buildFiscalSearchQueries(productText, fiscalUf);
   const currentCode = normalizeNcmCode(classification.ncm);
   const currentRow = getOfficialNcmRow(currentCode);
-  const fiscal = searchFiscal(productText, OPENAI_NCM_MAX_CANDIDATES);
-  const candidates = fiscal.ncm.slice(0, OPENAI_NCM_MAX_CANDIDATES).map(compactAiCandidate);
-  const localCandidate = findNcmMatch({ ...classification, ncm_importado: "" }, extractTokens(productText), { useImportedNcm: false });
   const company = getCompanyForFiscalUf(fiscalUf);
   const operation = getOperationForClassification(classification);
   const cfops = getCfopPair(operation, company);
-  const bestNcm = normalizeNcmCode(localCandidate?.codigo || currentCode);
-  const localFiscalTables = bestNcm && bestNcm !== "00000000"
-    ? compactFiscalTablesForAi(getFiscalTablesForNcm(bestNcm), fiscalUf)
-    : compactFiscalTablesForAi({}, fiscalUf);
   const useWeb = Boolean(options.use_web || options.useWeb);
-  const web = await fetchWebEvidence(productText, localCandidate, { useWeb, uf: fiscalUf });
+  const web = await fetchWebEvidence(productText, { useWeb, uf: fiscalUf });
   return {
     request_id: requestId,
     generated_at: now(),
     official_ncm_source: NCM_JSON_URL,
-    ncm_catalog: getNcmCatalogMetadata(),
     search_query: searchQueries.ncm,
     search_queries: searchQueries,
-    question: String(options.question || "").trim(),
     product: {
       id: classification.product_id,
       classification_id: classification.id,
@@ -3400,20 +2930,11 @@ async function buildAiNcmContext(classification, options = {}) {
       cfop_interestadual_default: cfops.interestadual,
       missing_context: ["destinatario", "uf_destino", "consumidor_final", "finalidade_da_operacao"]
     },
-    learning: {
-      enabled: AI_LEARNING_ENABLED,
-      source: AI_LEARNING_ENABLED ? "validated_rules" : "disabled"
-    },
     current: {
       ncm: currentCode || "00000000",
       exists_in_official: Boolean(currentRow),
       descricao: currentRow?.descricao || null
     },
-    local_best: compactAiCandidate(localCandidate),
-    candidates,
-    validated_rules: AI_LEARNING_ENABLED ? fiscal.validated_rules.slice(0, 5).map(compactValidatedRule) : [],
-    local_fiscal_tables: localFiscalTables,
-    base_results: compactAiBaseResults(fiscal.base_results),
     web_evidence: web
   };
 }
@@ -3509,7 +3030,6 @@ function buildOpenAiNcmInput(context = {}) {
   return {
     request_id: context.request_id,
     generated_at: context.generated_at,
-    ncm_catalog: context.ncm_catalog,
     search_queries: {
       ncm: context.search_queries?.ncm || "",
       ncm_cest: context.search_queries?.ncm_cest || "",
@@ -3524,9 +3044,6 @@ function buildOpenAiNcmInput(context = {}) {
     },
     tax_scope: context.tax_scope,
     operation: context.operation,
-    local_best: context.local_best,
-    candidates: (context.candidates || []).slice(0, OPENAI_NCM_MAX_CANDIDATES),
-    ncm_policy: context.ncm_policy,
     web_evidence: context.web_evidence,
     required_fiscal_fields: [
       "SKU",
@@ -3674,17 +3191,11 @@ function numberOrFallback(value, fallback = null) {
   return Number.isFinite(extracted) ? extracted : fallback;
 }
 
-function nonGenericFiscalValue(value, genericValues = []) {
-  const clean = asCleanString(value);
-  if (!clean) return "";
-  return genericValues.some((generic) => normalizeText(generic) === normalizeText(clean)) ? "" : clean;
-}
-
 function normalizeSimNaoIncerto(value, fallback = "incerto") {
   const text = normalizeText(value);
   if (["sim", "yes", "true", "obrigatorio", "obrigatoria"].includes(text)) return "sim";
-  if (["nao", "não", "no", "false", "sem", "inexistente"].includes(text)) return "nao";
-  if (text.includes("nao") || text.includes("sem cest") || text.includes("nao possui")) return "nao";
+  if (["nao", "não", "no", "false", "sem", "inexistente", "inaplicavel", "nao aplicavel", "nao se aplica"].includes(text)) return "nao";
+  if (text.includes("nao") || text.includes("sem cest") || text.includes("nao possui") || text.includes("inaplicavel")) return "nao";
   if (text.includes("sim") || text.includes("obrig")) return "sim";
   return fallback;
 }
@@ -3694,6 +3205,9 @@ function isNoCestSignal(value, required = "") {
   return (
     required === "nao" ||
     text.includes("sem cest") ||
+    text.includes("nao aplicavel") ||
+    text.includes("nao se aplica") ||
+    text.includes("inaplicavel") ||
     text.includes("nao possui cest") ||
     text.includes("nao ha cest") ||
     text.includes("nao tem cest") ||
@@ -3799,8 +3313,7 @@ function buildDefaultProductProfile(context = {}, ai = {}) {
     funcao_principal: asCleanString(explicit.funcao_principal, asCleanString(profile.funcao_principal, asCleanString(ai.product_category, product.descricao || ""))),
     funcionamento: asCleanString(explicit.funcionamento, profile.funcionamento),
     uso: asCleanString(explicit.uso, profile.uso),
-    caracteristicas: asStringArray(extraCharacteristics),
-    missing_characteristics: asStringArray(ai.faltando || profile.missing_characteristics)
+    caracteristicas: asStringArray(extraCharacteristics)
   };
 }
 
@@ -3820,363 +3333,6 @@ function buildFieldScores(ai = {}, confidence = 0) {
     pis_cofins: clampScore(scores.pis_cofins, 0.5),
     ipi: clampScore(scores.ipi, 0.35),
     cbenef: clampScore(scores.cbenef, 0.25)
-  };
-}
-
-function normalizeSmartQuestions(ai = {}, context = {}, confidence = 0) {
-  const questions = (Array.isArray(ai.smart_questions) ? ai.smart_questions : [])
-    .map((item) => ({
-      field: asCleanString(item?.field, "produto"),
-      question: asCleanString(item?.question),
-      options: asStringArray(item?.options, 4),
-      reason: asCleanString(item?.reason),
-      blocks_auto_apply: false
-    }))
-      .filter((item) => item.question)
-      .slice(0, 3);
-  const missing = asStringArray(ai.faltando, 4);
-
-  if (!questions.length && missing.length) {
-    questions.push({
-      field: "produto",
-      question: `Complete a descricao com: ${missing.join(", ")}.`,
-      options: missing,
-      reason: "Essas informacoes podem mudar o NCM ou o enquadramento fiscal.",
-      blocks_auto_apply: false
-    });
-  }
-
-  if (!questions.length && confidence < OPENAI_NCM_APPLY_THRESHOLD) {
-    questions.push({
-      field: "produto",
-      question: "Informe composicao, material, finalidade ou funcionamento do produto para aumentar a precisao fiscal.",
-      options: ["Adicionar detalhes tecnicos", "Manter para revisao manual"],
-      reason: "A confianca pode melhorar com mais detalhes.",
-      blocks_auto_apply: false
-    });
-  }
-
-  return questions;
-}
-
-function normalizedIncludesAny(text, terms = []) {
-  const normalized = normalizeText(text);
-  return terms.some((term) => normalized.includes(normalizeText(term)));
-}
-
-function addSmartQuestionOnce(questions, question) {
-  if (!question?.question) return;
-  const normalizedQuestion = normalizeText(question.question);
-  if (questions.some((item) => normalizeText(item.question) === normalizedQuestion)) return;
-  questions.push(question);
-}
-
-function buildBackendBlockingQuestions(context = {}, profile = {}, confidence = 0) {
-  const productText = normalizeText(
-    `${context.product?.descricao || ""} ${context.product?.marca || ""} ${context.product?.categoria || ""}`
-  );
-  const tokens = extractTokens(productText);
-  const questions = [];
-  const missing = asStringArray(profile.missing_characteristics, 8);
-
-  if (tokens.length <= 1) {
-    addSmartQuestionOnce(questions, {
-      field: "produto",
-      question: "Informe composicao, material, finalidade ou funcionamento do produto.",
-      options: ["Adicionar detalhes tecnicos", "Manter para revisao manual"],
-      reason: "Descricao muito curta para escolher uma NCM com seguranca.",
-      blocks_auto_apply: false
-    });
-  }
-
-  if (missing.length >= 3 && confidence < 0.93) {
-    addSmartQuestionOnce(questions, {
-      field: "produto",
-      question: "Complete as caracteristicas fiscais faltantes do produto.",
-      options: missing.slice(0, 4),
-      reason: "As caracteristicas faltantes podem mudar NCM, CEST ou tratamento fiscal.",
-      blocks_auto_apply: false
-    });
-  }
-
-  if (
-    productText.includes("cabo") &&
-    (!normalizedIncludesAny(productText, ["cobre", "condutor", "condutores", "dados", "energia", "carregamento", "carregar", "fibra", "optica", "optico", "eletrico", "ethernet", "coaxial"]) ||
-      (productText.includes("usb") && !normalizedIncludesAny(productText, ["cobre", "condutor", "condutores", "dados", "energia", "carregamento", "carregar", "fibra", "optica", "optico"])))
-  ) {
-    addSmartQuestionOnce(questions, {
-      field: "produto",
-      question: "O cabo possui condutores eletricos, transmite dados/energia ou e fibra optica?",
-      options: ["Condutor eletrico/dados", "Fibra optica", "Outro tipo de cabo"],
-      reason: "Cabos eletricos, cabos de dados e cabos de fibra optica podem cair em posicoes NCM diferentes.",
-      blocks_auto_apply: false
-    });
-  }
-
-  if (productText.includes("lapis") && !normalizedIncludesAny(productText, ["grafite", "escolar", "cor", "colorido", "maquiagem", "olho", "sobrancelha", "carpinteiro", "mecanico"])) {
-    addSmartQuestionOnce(questions, {
-      field: "produto",
-      question: "O lapis e escolar/grafite, de cor, maquiagem ou uso tecnico?",
-      options: ["Escolar/grafite", "De cor", "Maquiagem/uso cosmetico", "Uso tecnico"],
-      reason: "A palavra lapis sozinha pode representar mercadorias fiscais diferentes.",
-      blocks_auto_apply: false
-    });
-  }
-
-  if (normalizedIncludesAny(productText, ["queijo", "queijos"]) && !normalizedIncludesAny(productText, ["minas", "frescal", "mussarela", "mozarela", "prato", "parmesao", "ralado", "requeijao", "coalho", "gorgonzola"])) {
-    addSmartQuestionOnce(questions, {
-      field: "produto",
-      question: "Qual e o tipo do queijo?",
-      options: ["Minas frescal", "Mussarela", "Prato/parmesao", "Outro queijo"],
-      reason: "O tipo do queijo pode alterar o enquadramento dentro da posicao 0406.",
-      blocks_auto_apply: false
-    });
-  }
-
-  if (normalizedIncludesAny(productText, ["racao", "ração"]) && !normalizedIncludesAny(productText, ["gato", "gatos", "cao", "caes", "cachorro", "cachorros", "ave", "aves", "peixe", "peixes"])) {
-    addSmartQuestionOnce(questions, {
-      field: "produto",
-      question: "A racao e destinada a qual animal?",
-      options: ["Gatos", "Caes", "Aves/peixes", "Outro animal"],
-      reason: "A especie de destino ajuda a validar NCM e possivel CEST.",
-      blocks_auto_apply: false
-    });
-  }
-
-  if (
-    normalizedIncludesAny(productText, ["oculos de realidade virtual", "realidade virtual", "vr"]) &&
-    !normalizedIncludesAny(productText, ["autonomo", "all in one", "console", "computador", "smartphone", "periferico", "jogos"])
-  ) {
-    addSmartQuestionOnce(questions, {
-      field: "produto",
-      question: "O oculos VR e autonomo, periferico de computador/console ou depende de smartphone?",
-      options: ["Autonomo", "Periferico de computador/console", "Depende de smartphone"],
-      reason: "O funcionamento do equipamento pode mudar o enquadramento fiscal.",
-      blocks_auto_apply: false
-    });
-  }
-
-  return questions.slice(0, 3);
-}
-
-function mergeSmartQuestions(primary = [], secondary = []) {
-  const merged = [...primary];
-  for (const question of secondary) addSmartQuestionOnce(merged, question);
-  return merged.slice(0, 3);
-}
-
-function specificationOptionId(label) {
-  return normalizeText(label)
-    .replace(/[^a-z0-9]+/g, "-")
-    .replace(/^-+|-+$/g, "")
-    .slice(0, 48);
-}
-
-function cleanProductBaseDescription(value) {
-  const text = String(value || "").trim();
-  return text.replace(/^\s*\d+\s*[\-.)]\s*/, "").trim() || text;
-}
-
-function addSpecificationOption(options, label, baseDescription, details = {}) {
-  const cleanLabel = asCleanString(label);
-  if (!cleanLabel) return;
-  if (options.some((item) => normalizeText(item.label) === normalizeText(cleanLabel))) return;
-  const ncmHint = normalizeNcmCode(details.ncm_hint);
-  options.push({
-    id: details.id || specificationOptionId(cleanLabel),
-    label: cleanLabel,
-    description: asCleanString(details.description),
-    refined_description: asCleanString(details.refined_description, cleanLabel),
-    append_text: asCleanString(details.append_text, cleanLabel),
-    ncm_hint: ncmHint && getOfficialNcmRow(ncmHint) ? ncmHint : "",
-    confidence_hint: clampScore(details.confidence_hint, 0.55)
-  });
-}
-
-function addDetailQuestion(detailQuestions, question) {
-  if (!question?.field || !question?.label) return;
-  if (detailQuestions.some((item) => item.field === question.field)) return;
-  detailQuestions.push({
-    field: question.field,
-    label: question.label,
-    options: asStringArray(question.options, 8),
-    required_for: asCleanString(question.required_for, "descricao fiscal"),
-    blocks_auto_apply: false
-  });
-}
-
-function buildSpecificationMenu(context = {}, profile = {}, questions = []) {
-  const baseDescription = cleanProductBaseDescription(context.product?.descricao || profile.produto_base || "");
-  const productText = normalizeText(`${baseDescription} ${context.product?.marca || ""} ${context.product?.categoria || ""}`);
-  const productOptions = [];
-  const detailQuestions = [];
-
-  if (normalizedIncludesAny(productText, ["arroz"])) {
-    addSpecificationOption(productOptions, "Arroz tipo 1", baseDescription, {
-      description: "Arroz beneficiado comum para venda ao consumidor.",
-      ncm_hint: "10063021",
-      confidence_hint: 0.82
-    });
-    addSpecificationOption(productOptions, "Arroz parboilizado", baseDescription, {
-      description: "Arroz submetido ao processo de parboilizacao.",
-      ncm_hint: "10063021",
-      confidence_hint: 0.78
-    });
-    addSpecificationOption(productOptions, "Arroz integral", baseDescription, {
-      description: "Arroz descascado/integral, quando essa for a caracteristica real.",
-      ncm_hint: "10062020",
-      confidence_hint: 0.72
-    });
-    addSpecificationOption(productOptions, "Arroz arboreo para risoto", baseDescription, {
-      description: "Arroz especial para preparo de risoto.",
-      ncm_hint: "10063021",
-      confidence_hint: 0.7
-    });
-    addDetailQuestion(detailQuestions, {
-      field: "peso_embalagem",
-      label: "Peso/embalagem",
-      options: ["1 kg", "2 kg", "5 kg", "Fardo 5 kg", "Fardo 30 kg"],
-      required_for: "descricao e unidade",
-      blocks_auto_apply: false
-    });
-  }
-
-  if (productText.includes("cabo")) {
-    addSpecificationOption(productOptions, "Cabo USB de cobre para dados e energia", baseDescription, {
-      description: "Cabo com condutores eletricos e conectores para transmissao de dados/energia.",
-      confidence_hint: 0.8
-    });
-    addSpecificationOption(productOptions, "Cabo eletrico com condutores", baseDescription, {
-      description: "Condutor eletrico isolado, sem ser fibra optica.",
-      confidence_hint: 0.76
-    });
-    addSpecificationOption(productOptions, "Cabo de fibra optica", baseDescription, {
-      description: "Cabo composto por fibra optica para transmissao luminosa.",
-      confidence_hint: 0.76
-    });
-    addSpecificationOption(productOptions, "Cabo coaxial", baseDescription, {
-      description: "Cabo coaxial para sinal/comunicacao.",
-      confidence_hint: 0.68
-    });
-    addDetailQuestion(detailQuestions, {
-      field: "comprimento",
-      label: "Comprimento",
-      options: ["1 m", "2 m", "3 m", "5 m"],
-      required_for: "descricao comercial",
-      blocks_auto_apply: false
-    });
-  }
-
-  if (productText.includes("lapis")) {
-    addSpecificationOption(productOptions, "Lapis grafite escolar", baseDescription, {
-      description: "Lapis para escrita/desenho com mina de grafite.",
-      ncm_hint: "96091000",
-      confidence_hint: 0.82
-    });
-    addSpecificationOption(productOptions, "Lapis de cor escolar", baseDescription, {
-      description: "Lapis colorido para uso escolar ou artistico.",
-      ncm_hint: "96091000",
-      confidence_hint: 0.8
-    });
-    addSpecificationOption(productOptions, "Lapis de maquiagem para olhos", baseDescription, {
-      description: "Produto cosmetico para maquiagem.",
-      confidence_hint: 0.72
-    });
-    addDetailQuestion(detailQuestions, {
-      field: "apresentacao",
-      label: "Apresentacao",
-      options: ["Unidade", "Caixa com 12", "Caixa com 24"],
-      required_for: "descricao comercial",
-      blocks_auto_apply: false
-    });
-  }
-
-  if (normalizedIncludesAny(productText, ["queijo", "queijos"])) {
-    addSpecificationOption(productOptions, "Queijo Minas frescal", baseDescription, {
-      description: "Queijo fresco tipo Minas frescal.",
-      ncm_hint: "04061090",
-      confidence_hint: 0.84
-    });
-    addSpecificationOption(productOptions, "Queijo mussarela", baseDescription, {
-      description: "Mozarela/mussarela.",
-      ncm_hint: "04061010",
-      confidence_hint: 0.82
-    });
-    addSpecificationOption(productOptions, "Queijo parmesao ralado", baseDescription, {
-      description: "Queijo duro/ralado, quando essa for a apresentacao real.",
-      confidence_hint: 0.72
-    });
-    addSpecificationOption(productOptions, "Outros queijos", baseDescription, {
-      description: "Categoria generica quando o tipo nao for identificado.",
-      ncm_hint: "04069090",
-      confidence_hint: 0.62
-    });
-    addDetailQuestion(detailQuestions, {
-      field: "apresentacao",
-      label: "Apresentacao",
-      options: ["Peca", "Fatiado", "Ralado", "500 g", "1 kg"],
-      required_for: "descricao e CEST",
-      blocks_auto_apply: false
-    });
-  }
-
-  if (normalizedIncludesAny(productText, ["racao", "ração"])) {
-    addSpecificationOption(productOptions, "Racao para gatos", baseDescription, {
-      description: "Alimento preparado para gatos.",
-      ncm_hint: "23091000",
-      confidence_hint: 0.82
-    });
-    addSpecificationOption(productOptions, "Racao para caes", baseDescription, {
-      description: "Alimento preparado para caes.",
-      ncm_hint: "23091000",
-      confidence_hint: 0.82
-    });
-    addSpecificationOption(productOptions, "Racao para aves", baseDescription, {
-      description: "Alimento/preparacao para aves.",
-      confidence_hint: 0.68
-    });
-    addDetailQuestion(detailQuestions, {
-      field: "peso_embalagem",
-      label: "Peso/embalagem",
-      options: ["1 kg", "3 kg", "10 kg", "15 kg", "20 kg"],
-      required_for: "descricao e CEST",
-      blocks_auto_apply: false
-    });
-  }
-
-  if (normalizedIncludesAny(productText, ["realidade virtual", "oculos vr", "vr"])) {
-    addSpecificationOption(productOptions, "Oculos VR autonomo para jogos", baseDescription, {
-      description: "Equipamento independente, proprio para jogos/conteudo.",
-      confidence_hint: 0.72
-    });
-    addSpecificationOption(productOptions, "Oculos VR periferico de computador ou console", baseDescription, {
-      description: "Dispositivo dependente de computador ou console.",
-      confidence_hint: 0.68
-    });
-    addSpecificationOption(productOptions, "Oculos VR para smartphone", baseDescription, {
-      description: "Suporte/visualizador dependente de smartphone.",
-      confidence_hint: 0.62
-    });
-  }
-
-  for (const question of questions) {
-    for (const option of asStringArray(question.options, 4)) {
-      if (normalizedIncludesAny(option, ["revisao manual", "manter para revisao", "adicionar detalhes"])) continue;
-      addSpecificationOption(productOptions, option, baseDescription, {
-        description: question.reason || "",
-        confidence_hint: question.blocks_auto_apply ? 0.6 : 0.7
-      });
-    }
-  }
-
-  return {
-    visible: Boolean(productOptions.length || detailQuestions.length),
-    title: "Especificar produto",
-    description:
-      "Escolha a alternativa que melhor descreve o produto e complete os detalhes comerciais quando fizer sentido.",
-    base_description: baseDescription,
-    product_options: productOptions.slice(0, 8),
-    detail_questions: detailQuestions.slice(0, 3)
   };
 }
 
@@ -4287,7 +3443,7 @@ function buildFieldSuggestions(ai = {}, context = {}, code = "", description = "
           ? "Nao foi identificada obrigatoriedade de ICMS-ST/CEST para a descricao."
           : "ICMS-ST depende de NCM, CEST, UF, segmento e operacao."
     ),
-    origem: asCleanString(suggestion.origem, "0"),
+    origem: asCleanString(suggestion.origem),
     cst_pis: asCleanString(suggestion.cst_pis),
     aliquota_pis: numberOrFallback(suggestion.aliquota_pis, null),
     pis_cofins_reason: asCleanString(
@@ -4351,7 +3507,7 @@ function buildFiscalLayers(ai = {}, context = {}, fieldSuggestions = {}, profile
   };
 }
 
-function buildWhy(ai = {}, context = {}, code = "", description = "", questions = []) {
+function buildWhy(ai = {}, context = {}, code = "", description = "") {
   const why = ai.why || {};
   const alternatives = asStringArray(why.discarded_alternatives, 6);
   return {
@@ -4367,9 +3523,7 @@ function buildWhy(ai = {}, context = {}, code = "", description = "", questions 
     discarded_alternatives: alternatives.slice(0, 6),
     review_recommendation: asCleanString(
       why.review_recommendation,
-      questions.some((item) => item.blocks_auto_apply)
-        ? "Responder as perguntas antes de aprovar."
-        : "Revisar antes da primeira utilizacao fiscal."
+      "Campos aplicados conforme retorno da pesquisa fiscal."
     )
   };
 }
@@ -4440,58 +3594,6 @@ function pickWebEvidenceNcm(webEvidence, preferredCode) {
   return allCodes.length === 1 ? allCodes[0] : null;
 }
 
-function addAllowedNcm(allowed, code, source, evidenceCount = 0) {
-  const cleanCode = normalizeNcmCode(code);
-  if (!cleanCode || cleanCode.length !== 8 || cleanCode === "00000000") return;
-  const row = getOfficialNcmRow(cleanCode);
-  if (!row) return;
-  const existing = allowed.get(cleanCode) || {
-    codigo: cleanCode,
-    descricao: row.descricao || "",
-    sources: [],
-    evidence_count: 0
-  };
-  if (source && !existing.sources.includes(source)) existing.sources.push(source);
-  existing.evidence_count = Math.max(existing.evidence_count, Number(evidenceCount || 0));
-  allowed.set(cleanCode, existing);
-}
-
-function buildNcmDecisionPolicy(context = {}) {
-  const allowed = new Map();
-  addAllowedNcm(allowed, context.local_best?.codigo, "local_best");
-
-  for (const candidate of context.candidates || []) {
-    addAllowedNcm(allowed, candidate?.codigo, "candidate");
-  }
-
-  if (context.learning?.enabled) {
-    for (const rule of context.validated_rules || []) {
-      addAllowedNcm(allowed, rule?.ncm, "validated_rule");
-    }
-  }
-
-  return {
-    source: NCM_JSON_URL,
-    table_version: context.ncm_catalog?.latest_start_date || "",
-    apply_threshold: OPENAI_NCM_APPLY_THRESHOLD,
-    rule: "Web-first: allowed_ncms sao apoio local, nao bloqueio. O NCM pesquisado na web pode ser aplicado se tiver 8 digitos validos e nao for 00000000.",
-    allowed_ncms: [...allowed.values()].slice(0, 18)
-  };
-}
-
-function attachNcmDecisionPolicy(context = {}) {
-  return {
-    ...context,
-    ncm_policy: buildNcmDecisionPolicy(context)
-  };
-}
-
-function findAllowedNcmPolicyEntry(context = {}, code = "") {
-  const cleanCode = normalizeNcmCode(code);
-  const allowed = context.ncm_policy?.allowed_ncms || buildNcmDecisionPolicy(context).allowed_ncms;
-  return allowed.find((item) => normalizeNcmCode(item.codigo) === cleanCode) || null;
-}
-
 function aiSourcesSupportNcm(sources = [], code) {
   const cleanCode = normalizeNcmCode(code);
   if (!cleanCode) return false;
@@ -4507,13 +3609,13 @@ function aiSourceDescription(sources = [], code) {
 function normalizeAiClassificationStatus(status) {
   const text = normalizeText(status).replace(/\s+/g, "_");
   if (["classificado", "apply", "aplicado"].includes(text)) return "CLASSIFICADO";
-  if (["revisao_especificacao", "insufficient_info", "review", "uncertain", "falta_dados"].includes(text)) {
-    return "REVISAO_ESPECIFICACAO";
+  if (["review", "uncertain"].includes(text)) {
+    return "REVISAO_MANUAL";
   }
   if (["erro_base_fiscal", "base_error", "base_fiscal"].includes(text)) return "ERRO_BASE_FISCAL";
   if (["erro_openai", "openai_error"].includes(text)) return "ERRO_OPENAI";
   if (["erro_validacao", "invalid_ncm", "validation_error"].includes(text)) return "ERRO_VALIDACAO";
-  return "REVISAO_ESPECIFICACAO";
+  return "REVISAO_MANUAL";
 }
 
 function validateAiResponseIdentity(ai = {}, context = {}) {
@@ -4535,24 +3637,14 @@ function validateAiResponseIdentity(ai = {}, context = {}) {
 }
 
 function buildAiWarnings(ai, context, code) {
-  const warnings = asStringArray(ai?.avisos || ai?.warnings, 8);
-  const genericCandidate = [context.local_best, ...(context.candidates || [])].find(
-    (candidate) => normalizeNcmCode(candidate?.codigo) === code && candidate?.needs_specification
-  );
-  if (genericCandidate) {
-    const message =
-      genericCandidate.specification_message ||
-      "Produto pouco especificado; NCM aplicado pela categoria generica mais proxima.";
-    if (!warnings.some((warning) => normalizeText(warning) === normalizeText(message))) warnings.unshift(message);
-  }
-  return warnings.slice(0, 6);
+  return asStringArray(ai?.avisos || ai?.warnings, 8).slice(0, 6);
 }
 
 function buildStructuredFiscalOutput(context = {}, result = {}) {
   const profile = result.product_profile || {};
   const suggestions = result.field_suggestions || {};
   const fieldScores = result.field_scores || {};
-  const status = result.status || "REVISAO_ESPECIFICACAO";
+  const status = result.status || "REVISAO_MANUAL";
   const fiscalUf = context.tax_scope?.uf || context.company?.uf || "";
   const operation = String(context.operation?.type || "").toUpperCase();
   return {
@@ -4618,9 +3710,7 @@ function buildStructuredFiscalOutput(context = {}, result = {}) {
       vtottrib: suggestions.vtottrib || null
     },
     validacao: {
-      especificacao_suficiente: !result.validation?.insufficient_info,
-      faltando: result.product_profile?.missing_characteristics || [],
-      requer_revisao: !result.eligible_to_apply,
+      aplicou: Boolean(result.eligible_to_apply),
       status
     },
     justificativa_curta: result.reason || ""
@@ -4652,8 +3742,6 @@ function buildTechnicalAiPayload(context = {}, status = "ERRO_VALIDACAO", reason
     confianca_ncm: 0.01,
     cest_possivel: "",
     confianca_cest: 0,
-    especificacao_suficiente: false,
-    faltando: details.faltando || [],
     dados_fiscais: {
       sku: context.product?.sku || context.product?.codigo_produto || "",
       ean_gtin: context.product?.ean || context.product?.codigo_barras || "",
@@ -4697,36 +3785,22 @@ function normalizeAiNcmResult(ai, context) {
   const aiStatus = normalizeAiClassificationStatus(ai?.status);
   const identity = validateAiResponseIdentity(ai, context);
   const fiscal = aiFiscalData(ai);
-  const aiNcm = normalizeNcmCode(ai?.ncm || fiscal.ncm);
+  const rawNcmValue = ai?.ncm || fiscal.ncm;
+  const rawNcmDigits = String(rawNcmValue || "").replace(/\D/g, "");
+  const aiNcm = rawNcmDigits.length === 8 ? rawNcmDigits : "";
   const aiReturnedNcm = aiNcm && aiNcm !== "00000000" ? aiNcm : "";
-  const aiOfficial = aiReturnedNcm ? getOfficialNcmRow(aiReturnedNcm) : null;
-  const localReference = aiReturnedNcm ? findAllowedNcmPolicyEntry(context, aiReturnedNcm) : null;
   const cleanNcm = aiReturnedNcm;
   const official = cleanNcm ? getOfficialNcmRow(cleanNcm) : null;
-  const sourceList = localReference?.sources || [];
   const validNcm = Boolean(cleanNcm && cleanNcm.length === 8 && cleanNcm !== "00000000");
-  const localReferenceAvailable = Boolean(localReference);
-  const fromCandidates = sourceList.some((source) => ["candidate", "local_best"].includes(source));
   const fromAiSources = aiSourcesSupportNcm(ai?.fontes || ai?.sources || [], cleanNcm);
   const fromWebEvidence = Boolean(webEvidenceSupportsNcm(context.web_evidence, cleanNcm) || fromAiSources);
-  const invalidReturnedNcm = Boolean(aiReturnedNcm && !validNcm);
+  const invalidReturnedNcm = Boolean(rawNcmValue && rawNcmDigits.length !== 8);
   const confidence = clampConfidence(ai?.confianca_ncm ?? ai?.confidence);
   const productProfile = buildDefaultProductProfile(context, ai);
-  let smartQuestions = mergeSmartQuestions(
-    normalizeSmartQuestions(ai, context, confidence),
-    buildBackendBlockingQuestions(context, productProfile, confidence)
-  );
-  const blocksAutoApply = smartQuestions.some((item) => item.blocks_auto_apply);
-  const explicitlyInsufficient = ai?.especificacao_suficiente === false || aiStatus === "REVISAO_ESPECIFICACAO";
-  const insufficientInfo = Boolean(
-    (!validNcm && explicitlyInsufficient) ||
-      blocksAutoApply ||
-      (!validNcm && productProfile.missing_characteristics.length >= 3 && confidence < 0.75)
-  );
   const acceptedNcm = Boolean(identity.ok && validNcm && !invalidReturnedNcm);
   const outputNcm = acceptedNcm ? cleanNcm : "00000000";
   const description = acceptedNcm
-    ? official?.descricao || fiscalText(fiscal.descricao) || aiSourceDescription(ai?.fontes || ai?.sources || [], cleanNcm) || ""
+    ? fiscalText(fiscal.descricao) || official?.descricao || aiSourceDescription(ai?.fontes || ai?.sources || [], cleanNcm) || ""
     : "";
   const warnings = buildAiWarnings(ai, context, cleanNcm);
   let status = aiStatus;
@@ -4738,18 +3812,11 @@ function normalizeAiNcmResult(ai, context) {
     status = "ERRO_VALIDACAO";
     const message = `NCM retornado invalido: ${ai?.ncm || fiscal.ncm || "vazio"}.`;
     warnings.unshift(message);
-  } else if (acceptedNcm && !aiOfficial) {
+  } else if (acceptedNcm && !official) {
     const message = `NCM ${outputNcm} aplicado pela pesquisa web, mas nao localizado na base NCM oficial local.`;
     if (!warnings.some((warning) => normalizeText(warning) === normalizeText(message))) warnings.unshift(message);
   } else if (acceptedNcm && !["ERRO_BASE_FISCAL", "ERRO_OPENAI", "ERRO_VALIDACAO"].includes(status)) {
     status = "CLASSIFICADO";
-  } else if (status === "CLASSIFICADO" && insufficientInfo) {
-    status = "REVISAO_ESPECIFICACAO";
-  }
-
-  if (acceptedNcm && smartQuestions.length) {
-    const message = "NCM aplicado pela pesquisa web; perguntas ficam apenas como apoio para melhorar a descricao fiscal.";
-    if (!warnings.some((warning) => normalizeText(warning) === normalizeText(message))) warnings.unshift(message);
   }
 
   if (!acceptedNcm && aiReturnedNcm && !invalidReturnedNcm) {
@@ -4776,11 +3843,9 @@ function normalizeAiNcmResult(ai, context) {
     sources: normalizeSources(ai?.fontes || ai?.sources || [], outputNcm, context),
     product_profile: productProfile,
     field_scores: fieldScores,
-    smart_questions: smartQuestions,
-    specification_menu: buildSpecificationMenu(context, productProfile, smartQuestions),
     fiscal_layers: buildFiscalLayers(ai, context, fieldSuggestions, productProfile),
     field_suggestions: fieldSuggestions,
-    why: buildWhy(ai, context, outputNcm, acceptedNcm ? description : "", smartQuestions),
+    why: buildWhy(ai, context, outputNcm, acceptedNcm ? description : ""),
     eligible_to_apply: safeToApply,
     validation: {
       status,
@@ -4788,20 +3853,15 @@ function normalizeAiNcmResult(ai, context) {
       request_id_returned: ai?.request_id || null,
       request_id_ok: identity.ok,
       exists_in_official: Boolean(official),
-      local_reference_available: localReferenceAvailable,
       web_first_policy: true,
-      from_candidates: fromCandidates,
       from_web_evidence: fromWebEvidence,
       from_ai_sources: fromAiSources,
       threshold: OPENAI_NCM_APPLY_THRESHOLD,
-      blocks_auto_apply: blocksAutoApply,
-      insufficient_info: insufficientInfo,
       researched_ncm: acceptedNcm,
       auto_apply_source_allowed: true,
       returned_ncm: aiReturnedNcm || null,
       selected_ncm: outputNcm !== "00000000" ? outputNcm : null,
-      rejected_ncm: outputNcm === "00000000" && aiReturnedNcm ? aiReturnedNcm : null,
-      allowed_ncms: (context.ncm_policy?.allowed_ncms || []).map((item) => item.codigo)
+      rejected_ncm: outputNcm === "00000000" && aiReturnedNcm ? aiReturnedNcm : null
     }
   };
   result.final_json = buildStructuredFiscalOutput(context, result);
@@ -4809,13 +3869,13 @@ function normalizeAiNcmResult(ai, context) {
 }
 
 async function prepareAiNcmContext(classification, options = {}) {
-  return attachNcmDecisionPolicy(await buildAiNcmContext(classification, { ...options, use_web: false, useWeb: false }));
+  return buildAiNcmContext(classification, { ...options, use_web: false, useWeb: false });
 }
 
 async function buildAiNcmSuggestion(classification, options = {}) {
-  const enrichedContext = options.context?.ncm_policy
+  const enrichedContext = options.context?.request_id
     ? options.context
-    : attachNcmDecisionPolicy(await buildAiNcmContext(classification, options));
+    : await buildAiNcmContext(classification, options);
 
   let response;
   try {
@@ -4896,26 +3956,12 @@ function getOperationForClassification(classification) {
   return normalizeOperationType(row?.operation_type || "venda");
 }
 
-function isGenericIbsCbsPair(cst, cclass) {
-  return asCleanString(cst) === "000" && asCleanString(cclass) === "000001";
-}
-
-function trustedPreviousIbsCbsValue(previous, field) {
-  const cst = asCleanString(previous?.ibs_cbs_cst);
-  const cclass = asCleanString(previous?.cclass_trib);
-  if (!cst || !cclass || isGenericIbsCbsPair(cst, cclass)) return "";
-  return asCleanString(previous?.[field]);
-}
-
-function resolveIbsCbsPatch(previous, suggested = {}) {
+function resolveIbsCbsPatch(suggested = {}) {
   const suggestedCst = asCleanString(suggested.ibs_cbs_cst);
   const suggestedClass = asCleanString(suggested.cclass_trib);
-  if (suggestedCst && suggestedClass) {
-    return { ibs_cbs_cst: suggestedCst, cclass_trib: suggestedClass };
-  }
   return {
-    ibs_cbs_cst: trustedPreviousIbsCbsValue(previous, "ibs_cbs_cst") || null,
-    cclass_trib: trustedPreviousIbsCbsValue(previous, "cclass_trib") || null
+    ibs_cbs_cst: suggestedCst || null,
+    cclass_trib: suggestedClass || null
   };
 }
 
@@ -4925,7 +3971,7 @@ function buildFiscalPatchFromNcm(previous, ncm, aiResult = null) {
   const operation = getOperationForClassification(previous);
   const cfops = getCfopPair(operation, company);
   const suggested = aiResult?.field_suggestions || {};
-  const ibsCbsPatch = resolveIbsCbsPatch(previous, suggested);
+  const ibsCbsPatch = resolveIbsCbsPatch(suggested);
   const suggestedCest = normalizeCestSuggestion(suggested.cest, suggested.cest_required);
   const noCestRequired = isNoCestSignal(suggestedCest, suggested.cest_required);
   const finalCest = noCestRequired ? "SEM CEST OBRIGATORIO" : suggestedCest || null;
@@ -5070,7 +4116,7 @@ async function checkClassificationAiNcm(id, options = {}, actor = "contador") {
   assertOpenAiConfigured();
   const previous = getClassification(id);
   if (!previous) return null;
-  const context = options.context?.ncm_policy ? options.context : await prepareAiNcmContext(previous, options);
+  const context = options.context?.request_id ? options.context : await prepareAiNcmContext(previous, options);
   const billing = options.skip_billing
     ? options.billing || null
     : await resolveAiBillingForUse({ classificationId: id, quantity: 1, actor, context: "item", options });
@@ -6003,87 +5049,6 @@ function updateClassification(id, patch, actor = "contador") {
   return updated;
 }
 
-function reclassifyClassification(id, actor = "contador") {
-  const previous = getClassification(id);
-  if (!previous) return null;
-  const operation = getOperationForClassification(previous);
-  const suggestion = classifyProduct(previous, operation, previous.uf);
-  db.prepare(`
-    UPDATE classifications SET
-      operation_type = ?, uf = ?, sku = ?, ean = ?, ncm = ?, cest = ?, cfop_interno = ?, cfop_interestadual = ?,
-      cst_icms = ?, aliquota_icms = ?, icms_st = ?, csosn = ?, origem = ?, cst_pis = ?,
-      aliquota_pis = ?, cst_cofins = ?, aliquota_cofins = ?, aliquota_fcp = ?,
-      ibs_cbs_cst = ?, cclass_trib = ?, ipi = ?, ex_tipi = ?, cbenef = ?, vtottrib = ?,
-      confianca = ?, status = ?, observacao = ?, sugestao_json = ?, updated_at = ?
-    WHERE id = ?
-  `).run(
-    suggestion.operation_type,
-    suggestion.uf,
-    suggestion.sku,
-    suggestion.ean,
-    suggestion.ncm,
-    suggestion.cest,
-    suggestion.cfop_interno,
-    suggestion.cfop_interestadual,
-    suggestion.cst_icms,
-    suggestion.aliquota_icms,
-    suggestion.icms_st,
-    suggestion.csosn,
-    suggestion.origem,
-    suggestion.cst_pis,
-    suggestion.aliquota_pis,
-    suggestion.cst_cofins,
-    suggestion.aliquota_cofins,
-    suggestion.aliquota_fcp,
-    suggestion.ibs_cbs_cst,
-    suggestion.cclass_trib,
-    suggestion.ipi,
-    suggestion.ex_tipi,
-    suggestion.cbenef,
-    suggestion.vtottrib,
-    suggestion.confianca,
-    "pending_review",
-    "Reclassificado automaticamente para nova revisão do contador.",
-    asJson(suggestion.sugestao_json),
-    now(),
-    id
-  );
-  const updated = getClassification(id);
-  logAudit("classification", id, "reclassify", actor, previous, updated);
-  return updated;
-}
-
-function refineClassificationDescription(id, description, actor = "contador") {
-  const current = getClassification(id);
-  if (!current) return null;
-  const descricao = String(description || "").trim();
-  if (!descricao) {
-    const error = new Error("Informe uma descricao para especificar o produto.");
-    error.status = 422;
-    throw error;
-  }
-  db.prepare("UPDATE products SET descricao_original = ?, descricao_tratada = ? WHERE id = ?").run(
-    descricao,
-    normalizeText(descricao),
-    current.product_id
-  );
-  logAudit("product", current.product_id, "refine_description", actor, current, { descricao_original: descricao });
-  return reclassifyClassification(id, actor);
-}
-
-function reclassifyReviewTable(actor = "contador") {
-  const rows = db
-    .prepare("SELECT id FROM classifications WHERE status != 'approved' OR ncm = '00000000' ORDER BY id")
-    .all();
-  const updated = [];
-  for (const row of rows) {
-    const item = reclassifyClassification(row.id, actor);
-    if (item) updated.push(item);
-  }
-  logAudit("review_table", null, "reclassify_all", actor, { total: rows.length }, { total: updated.length });
-  return { reclassified: updated.length };
-}
-
 function approveClassification(id, actor = "contador") {
   const updated = updateClassification(id, { status: "approved", confianca: 1 }, actor);
   if (!updated) return null;
@@ -6094,42 +5059,8 @@ function approveClassification(id, actor = "contador") {
     id
   );
   const approved = getClassification(id);
-  if (AI_LEARNING_ENABLED) saveValidatedRule(approved, actor);
   logAudit("classification", id, "approve", actor, updated, approved);
   return approved;
-}
-
-function saveValidatedRule(classification, actor) {
-  const tokens = extractTokens(classification.descricao_tratada || classification.descricao_original);
-  db.prepare(`
-    INSERT INTO validated_rules (
-      descricao_base, palavras_chave, empresa_id, tipo_operacao, segmento, ncm, cfop_padrao_interno,
-      cfop_padrao_interestadual, csosn, cst_icms, aliquota_icms, pis, aliquota_pis,
-      cofins, aliquota_cofins, cest, aliquota_fcp, ibs_cbs_cst, cclass_trib,
-      contador_id, data_validacao
-    ) VALUES (?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-  `).run(
-    classification.descricao_tratada || classification.descricao_original,
-    asJson(tokens, []),
-    normalizeOperationType(classification.operation_type),
-    classification.categoria || null,
-    classification.ncm,
-    classification.cfop_interno,
-    classification.cfop_interestadual,
-    classification.csosn,
-    classification.cst_icms,
-    classification.aliquota_icms,
-    classification.cst_pis,
-    classification.aliquota_pis,
-    classification.cst_cofins,
-    classification.aliquota_cofins,
-    classification.cest,
-    classification.aliquota_fcp,
-    classification.ibs_cbs_cst,
-    classification.cclass_trib,
-    actor,
-    now()
-  );
 }
 
 function getDashboard() {
@@ -6207,8 +5138,7 @@ function getCatalogs() {
     cst_pis: db.prepare("SELECT * FROM cst_pis ORDER BY codigo").all(),
     cst_cofins: db.prepare("SELECT * FROM cst_cofins ORDER BY codigo").all(),
     ibs_cbs_cst: db.prepare("SELECT * FROM ibs_cbs_cst ORDER BY codigo").all(),
-    ibs_cbs_classificacao: db.prepare("SELECT * FROM ibs_cbs_classificacao ORDER BY cclass_trib").all(),
-    validated_rules: []
+    ibs_cbs_classificacao: db.prepare("SELECT * FROM ibs_cbs_classificacao ORDER BY cclass_trib").all()
   };
 }
 
@@ -6583,18 +5513,6 @@ async function handleRequest(req, res) {
     return sendJson(res, 200, clearReviewTable(payload.actor || "contador"));
   }
 
-  if (req.method === "POST" && path === "/api/classifications/reclassify") {
-    const payload = JSON.parse(decodeText(await readBody(req)) || "{}");
-    assertAiProcessingUnlocked();
-    return sendJson(res, 200, reclassifyReviewTable(payload.actor || "contador"));
-  }
-
-  if (req.method === "POST" && path === "/api/classifications/ncm-check") {
-    const payload = JSON.parse(decodeText(await readBody(req)) || "{}");
-    assertAiProcessingUnlocked();
-    return sendJson(res, 200, await checkReviewTableNcm(payload, payload.actor || "contador"));
-  }
-
   if (req.method === "POST" && path === "/api/classifications/ai-ncm") {
     const payload = JSON.parse(decodeText(await readBody(req)) || "{}");
     assertAiProcessingUnlocked(payload.billing_event_id || payload.billingEventId);
@@ -6624,42 +5542,11 @@ async function handleRequest(req, res) {
     return sendJson(res, 200, updated);
   }
 
-  const reclassifyMatch = path.match(/^\/api\/classifications\/(\d+)\/reclassify$/);
-  if (reclassifyMatch && req.method === "POST") {
-    const payload = JSON.parse(decodeText(await readBody(req)) || "{}");
-    assertAiProcessingUnlocked();
-    const updated = reclassifyClassification(Number(reclassifyMatch[1]), payload.actor || "contador");
-    if (!updated) return sendJson(res, 404, { error: "Classificacao nao encontrada." });
-    return sendJson(res, 200, updated);
-  }
-
-  const ncmCheckMatch = path.match(/^\/api\/classifications\/(\d+)\/ncm-check$/);
-  if (ncmCheckMatch && req.method === "POST") {
-    const payload = JSON.parse(decodeText(await readBody(req)) || "{}");
-    assertAiProcessingUnlocked();
-    const updated = await checkClassificationNcm(Number(ncmCheckMatch[1]), payload, payload.actor || "contador");
-    if (!updated) return sendJson(res, 404, { error: "Classificacao nao encontrada." });
-    return sendJson(res, 200, updated);
-  }
-
   const aiNcmMatch = path.match(/^\/api\/classifications\/(\d+)\/ai-ncm$/);
   if (aiNcmMatch && req.method === "POST") {
     const payload = JSON.parse(decodeText(await readBody(req)) || "{}");
     assertAiProcessingUnlocked(payload.billing_event_id || payload.billingEventId);
     const updated = await checkClassificationAiNcm(Number(aiNcmMatch[1]), payload, payload.actor || "contador");
-    if (!updated) return sendJson(res, 404, { error: "Classificacao nao encontrada." });
-    return sendJson(res, 200, updated);
-  }
-
-  const refineMatch = path.match(/^\/api\/classifications\/(\d+)\/refine$/);
-  if (refineMatch && req.method === "POST") {
-    const payload = JSON.parse(decodeText(await readBody(req)) || "{}");
-    assertAiProcessingUnlocked();
-    const updated = refineClassificationDescription(
-      Number(refineMatch[1]),
-      payload.descricao || payload.descricao_original,
-      payload.actor || "contador"
-    );
     if (!updated) return sendJson(res, 404, { error: "Classificacao nao encontrada." });
     return sendJson(res, 200, updated);
   }
