@@ -42,7 +42,7 @@ const OPENAI_NCM_API_URL = process.env.OPENAI_NCM_API_URL || "https://api.openai
 const OPENAI_NCM_APPLY_THRESHOLD = Math.min(Math.max(Number(process.env.OPENAI_NCM_APPLY_THRESHOLD || 0.9), 0.9), 0.99);
 const OPENAI_NCM_MAX_CANDIDATES = Math.min(Math.max(Number(process.env.OPENAI_NCM_MAX_CANDIDATES || 8), 3), 15);
 const OPENAI_NCM_TIMEOUT_MS = Math.min(Math.max(Number(process.env.OPENAI_NCM_TIMEOUT_MS || 30000), 8000), 90000);
-const OPENAI_NCM_MAX_OUTPUT_TOKENS = Math.min(Math.max(Number(process.env.OPENAI_NCM_MAX_OUTPUT_TOKENS || 1200), 600), 3000);
+const OPENAI_NCM_MAX_OUTPUT_TOKENS = Math.min(Math.max(Number(process.env.OPENAI_NCM_MAX_OUTPUT_TOKENS || 1800), 800), 3500);
 const OPENAI_NCM_WEB_SEARCH_ENABLED = String(process.env.OPENAI_NCM_WEB_SEARCH_ENABLED || "true").toLowerCase() !== "false";
 const OPENAI_NCM_CONCURRENCY_INPUT = Number(process.env.OPENAI_NCM_CONCURRENCY || 10);
 const OPENAI_NCM_CONCURRENCY = Math.min(
@@ -512,8 +512,13 @@ function setupDatabase() {
       aliquota_fcp REAL,
       ibs_cbs_cst TEXT,
       cclass_trib TEXT,
+      aliquota_ibs_uf REAL,
+      aliquota_ibs_municipio REAL,
+      aliquota_cbs REAL,
+      cst_ipi TEXT,
       ipi REAL,
       ex_tipi TEXT,
+      cenq TEXT,
       cbenef TEXT,
       vtottrib REAL,
       confianca REAL NOT NULL DEFAULT 0,
@@ -724,7 +729,12 @@ function setupDatabase() {
     { name: "aliquota_icms", type: "REAL" },
     { name: "icms_st", type: "TEXT" },
     { name: "aliquota_fcp", type: "REAL" },
-    { name: "ex_tipi", type: "TEXT" }
+    { name: "aliquota_ibs_uf", type: "REAL" },
+    { name: "aliquota_ibs_municipio", type: "REAL" },
+    { name: "aliquota_cbs", type: "REAL" },
+    { name: "cst_ipi", type: "TEXT" },
+    { name: "ex_tipi", type: "TEXT" },
+    { name: "cenq", type: "TEXT" }
   ]);
   ensureTableColumns("validated_rules", [
     { name: "tipo_operacao", type: "TEXT" },
@@ -2071,7 +2081,7 @@ function ncmRobotConfig() {
         "SERPAPI_KEY",
         "GOOGLE_CSE_KEY + GOOGLE_CSE_CX"
       ],
-      policy: "A web so roda quando a base local ficar incerta ou divergente, e entra apenas como evidencia."
+      policy: "A web e a fonte principal do classificador automatico; a base local entra apenas como apoio de contexto."
     },
     openai: aiNcmConfig(),
     external_ai_cost: OPENAI_API_KEY
@@ -2098,7 +2108,7 @@ function aiNcmConfig() {
       enabled: AI_LEARNING_ENABLED,
       mode: "removed"
     },
-    policy: "O classificador usa whitelist da NCM oficial vigente, escolhe apenas entre candidatos validados e so aplica automaticamente com 90% ou mais, sem pergunta bloqueante."
+    policy: "Web-first: o classificador pesquisa os dados fiscais do produto e aplica o retorno quando o NCM tem 8 digitos validos, sem depender de referencias locais ou aprendizado."
   };
 }
 
@@ -2746,8 +2756,8 @@ function buildFiscalSearchQueries(productName, uf = "") {
     cfop: `${cleanProduct} CFOP venda compra dentro fora do estado origem${ufSuffix}`,
     icms_st_fcp: `${cleanProduct} ICMS ST FCP CEST aliquota${ufSuffix}`,
     pis_cofins: `${cleanProduct} PIS COFINS CST aliquota NCM`,
-    ibs_cbs: `${cleanProduct} IBS CBS CST cClassTrib LC 214 2025 reducao aliquota zero beneficio fiscal`,
-    fiscal_full: `${cleanProduct} NCM CEST EX TIPI CFOP ICMS ST FCP PIS COFINS IPI IBS CBS cClassTrib beneficio fiscal${ufSuffix}`
+    ibs_cbs: `${cleanProduct} IBS CBS CST cClassTrib aliquota IBS UF aliquota IBS municipio aliquota CBS LC 214 2025 reducao beneficio fiscal`,
+    fiscal_full: `${cleanProduct} NCM CEST Unidade Origem CFOP CST ICMS CSOSN aliquota ICMS ICMS-ST FCP CST PIS aliquota PIS CST COFINS aliquota COFINS CST IPI aliquota IPI EX TIPI cEnq IBS CBS cClassTrib aliquota IBS UF aliquota IBS municipio aliquota CBS cBenef vTotTrib${ufSuffix}`
   };
 }
 
@@ -2865,7 +2875,7 @@ function evaluateNcmCheck({ currentCode, currentRow, currentScore, candidate }) 
       : {
           status: "invalid",
           severity: "danger",
-          message: `NCM atual ${currentCode} nao esta ativo na tabela oficial e o robo nao encontrou candidato forte.`
+          message: `NCM atual ${currentCode} nao esta ativo na tabela oficial e o robo nao encontrou referencia local forte.`
         };
   }
 
@@ -3037,6 +3047,7 @@ const AI_NCM_SCHEMA = {
     "confianca_cest",
     "especificacao_suficiente",
     "faltando",
+    "dados_fiscais",
     "justificativa_curta",
     "status",
     "fontes",
@@ -3088,6 +3099,74 @@ const AI_NCM_SCHEMA = {
     confianca_cest: { type: "number" },
     especificacao_suficiente: { type: "boolean" },
     faltando: { type: "array", items: { type: "string" } },
+    dados_fiscais: {
+      type: "object",
+      additionalProperties: false,
+      required: [
+        "sku",
+        "ean_gtin",
+        "descricao",
+        "ncm",
+        "cest",
+        "unidade",
+        "origem",
+        "cfop_interno",
+        "cfop_interestadual",
+        "cst_icms",
+        "csosn",
+        "aliquota_icms",
+        "icms_st",
+        "aliquota_fcp",
+        "cst_pis",
+        "aliquota_pis",
+        "cst_cofins",
+        "aliquota_cofins",
+        "cst_ipi",
+        "aliquota_ipi",
+        "ex_tipi",
+        "cenq",
+        "ibs_cbs_cst",
+        "cclass_trib",
+        "aliquota_ibs_uf",
+        "aliquota_ibs_municipio",
+        "aliquota_cbs",
+        "cbenef",
+        "vtottrib",
+        "observacao"
+      ],
+      properties: {
+        sku: { type: "string" },
+        ean_gtin: { type: "string" },
+        descricao: { type: "string" },
+        ncm: { type: "string" },
+        cest: { type: "string" },
+        unidade: { type: "string" },
+        origem: { type: "string" },
+        cfop_interno: { type: "string" },
+        cfop_interestadual: { type: "string" },
+        cst_icms: { type: "string" },
+        csosn: { type: "string" },
+        aliquota_icms: { type: "string" },
+        icms_st: { type: "string" },
+        aliquota_fcp: { type: "string" },
+        cst_pis: { type: "string" },
+        aliquota_pis: { type: "string" },
+        cst_cofins: { type: "string" },
+        aliquota_cofins: { type: "string" },
+        cst_ipi: { type: "string" },
+        aliquota_ipi: { type: "string" },
+        ex_tipi: { type: "string" },
+        cenq: { type: "string" },
+        ibs_cbs_cst: { type: "string" },
+        cclass_trib: { type: "string" },
+        aliquota_ibs_uf: { type: "string" },
+        aliquota_ibs_municipio: { type: "string" },
+        aliquota_cbs: { type: "string" },
+        cbenef: { type: "string" },
+        vtottrib: { type: "string" },
+        observacao: { type: "string" }
+      }
+    },
     justificativa_curta: { type: "string" },
     status: {
       type: "string",
@@ -3121,18 +3200,20 @@ function assertOpenAiConfigured() {
 
 function aiNcmInstructions() {
   return [
-    "Voce e o classificador stateless de NCM da Aikkie para produtos vendidos no Brasil.",
+    "Voce e o classificador fiscal web-first da Aikkie para produtos vendidos no Brasil.",
     "Cada requisicao e independente. Use request_id e sku recebidos no contexto e devolva exatamente os mesmos valores; nao use memoria, conversa anterior, produto anterior ou inferencia de outro item.",
-    "Utilize exclusivamente caracteristicas explicitamente informadas na descricao do produto. Nao presuma finalidade, material, composicao, mecanismo, funcionamento, embalagem, origem, aplicacao ou uso quando isso nao estiver escrito.",
-    "Extraia somente as caracteristicas explicitas e escolha o NCM mais compativel entre ncm_policy.allowed_ncms. Nunca retorne NCM fora dessa whitelist.",
-    "Se ncm_policy.allowed_ncms estiver vazio, retorne ncm '00000000', status 'ERRO_BASE_FISCAL' e explique que a base/candidatos do backend vieram vazios.",
-    "Se existir candidato, mas a descricao nao tiver informacao suficiente para decidir entre NCMs que podem mudar pela composicao, material, finalidade, funcionamento ou uso, retorne status 'REVISAO_ESPECIFICACAO', ncm '00000000' e liste os campos em faltando.",
-    "Se o NCM escolhido tiver confianca menor que 0.90, retorne status 'REVISAO_ESPECIFICACAO' e ncm '00000000'.",
-    "Nao calcule CFOP, CST/CSOSN, ICMS, FCP, PIS, COFINS, IPI, IBS/CBS, cClassTrib, cBenef ou vTotTrib. Esses campos pertencem ao backend fiscal.",
-    "Voce pode preencher cest_possivel somente se a evidencia/candidato indicar um CEST claramente relacionado ao produto; caso contrario use string vazia.",
-    "Diferencie produto base de acessorio ou uso: cabo eletrico, cabo de dados e cabo de fibra optica podem ter NCM diferente; lapis escolar nao e apontador; lapis de maquiagem e cosmetico; rolo de pintura nao e reagente; racao de gatos ou cachorros e alimento para animais.",
-    "Priorize frase especifica, funcao principal, composicao, material, finalidade, funcionamento e uso sobre repeticao de palavra solta.",
-    "A justificativa_curta deve ser curta, objetiva e baseada nos candidatos permitidos/fontes. Nada de resposta longa.",
+    "Pesquise na web usando search_queries.fiscal_full e consultas equivalentes ao estilo: '<descricao do produto> ncm UF <UF> SKU EAN GTIN Descricao NCM CEST Unidade Origem CFOP CST ICMS CSOSN aliquota ICMS ICMS-ST FCP PIS COFINS IPI EX TIPI cEnq IBS CBS cClassTrib cBenef vTotTrib'.",
+    "Use o resultado web mais direto encontrado, inclusive resumos/visoes gerais quando aparecerem, e extraia os codigos/campos fiscais retornados para dados_fiscais.",
+    "As referencias locais em ncm_policy.allowed_ncms sao apenas apoio. Nao bloqueie um NCM pesquisado na web so porque ele nao apareceu nas referencias locais.",
+    "Se a descricao for generica, classifique pelo entendimento comercial comum retornado pela busca web. So use REVISAO_ESPECIFICACAO quando a web deixar claro que existem alternativas fiscais incompatíveis e impossiveis de decidir.",
+    "Preencha todos os campos de dados_fiscais. Quando a web disser que nao possui CEST/cBenef/EX TIPI obrigatorio, use 'SEM CEST OBRIGATORIO', 'SEM CBENEF' ou string vazia conforme o campo.",
+    "Nao invente EAN/GTIN. Se a fonte mostrar EAN generico, exemplo, 7890000000000, 0000000000000 ou placeholder, retorne ean_gtin vazio.",
+    "Para CFOP, use operation.cfop_interno_default e operation.cfop_interestadual_default quando a busca nao trouxer valor melhor.",
+    "Para UF, considere tax_scope.uf como UF fiscal da pesquisa, principalmente para ICMS, ICMS-ST, FCP, CEST e cBenef.",
+    "Para NCM, retorne sempre 8 digitos sem ponto em ncm e dados_fiscais.ncm. Para CEST, retorne 7 digitos sem ponto quando houver codigo.",
+    "Para percentuais, retorne apenas o numero como texto, sem o simbolo %, usando ponto ou virgula decimal.",
+    "Se algum campo realmente nao aparecer em nenhuma evidencia, deixe string vazia e explique em dados_fiscais.observacao/avisos.",
+    "A justificativa_curta deve ser curta, objetiva e baseada no que a busca retornou. Nada de resposta longa.",
     "Retorne apenas JSON no formato do schema."
   ].join(" ");
 }
@@ -3446,7 +3527,38 @@ function buildOpenAiNcmInput(context = {}) {
     local_best: context.local_best,
     candidates: (context.candidates || []).slice(0, OPENAI_NCM_MAX_CANDIDATES),
     ncm_policy: context.ncm_policy,
-    web_evidence: context.web_evidence
+    web_evidence: context.web_evidence,
+    required_fiscal_fields: [
+      "SKU",
+      "EAN/GTIN",
+      "Descricao",
+      "NCM",
+      "CEST",
+      "Unidade",
+      "Origem da mercadoria",
+      "CFOP interno",
+      "CFOP interestadual",
+      "CST ICMS",
+      "CSOSN",
+      "Aliquota ICMS",
+      "ICMS-ST",
+      "FCP",
+      "CST PIS",
+      "Aliquota PIS",
+      "CST COFINS",
+      "Aliquota COFINS",
+      "CST IPI",
+      "Aliquota IPI",
+      "EX TIPI",
+      "cEnq",
+      "CST IBS/CBS",
+      "cClassTrib",
+      "Aliquota IBS UF",
+      "Aliquota IBS Municipio",
+      "Aliquota CBS",
+      "cBenef",
+      "vTotTrib"
+    ]
   };
 }
 
@@ -3491,7 +3603,7 @@ async function callOpenAiNcm(context) {
         }
       }
     ];
-    request.tool_choice = "auto";
+    request.tool_choice = "required";
     request.include = ["web_search_call.results"];
   }
 
@@ -3553,8 +3665,13 @@ function asStringArray(value, limit = 8) {
 
 function numberOrFallback(value, fallback = null) {
   if (value === "" || value === null || value === undefined) return fallback;
-  const number = Number(String(value).replace(",", "."));
-  return Number.isFinite(number) ? number : fallback;
+  const raw = String(value).replace(",", ".");
+  const number = Number(raw);
+  if (Number.isFinite(number)) return number;
+  const match = raw.match(/-?\d+(?:\.\d+)?/);
+  if (!match) return fallback;
+  const extracted = Number(match[0]);
+  return Number.isFinite(extracted) ? extracted : fallback;
 }
 
 function nonGenericFiscalValue(value, genericValues = []) {
@@ -3624,6 +3741,42 @@ function normalizeCestSuggestion(value, required = "") {
   return text;
 }
 
+function aiFiscalData(ai = {}) {
+  return ai.dados_fiscais || ai.fiscal_fields || {};
+}
+
+function fiscalText(value, fallback = "") {
+  return asCleanString(value, fallback);
+}
+
+function cleanFiscalCode(value, length = null) {
+  const digits = String(value || "").replace(/\D/g, "");
+  if (!digits) return "";
+  return length ? digits.slice(0, length) : digits;
+}
+
+function isPlaceholderEan(value) {
+  const text = normalizeText(value);
+  const digits = cleanFiscalCode(value);
+  return (
+    !digits ||
+    text.includes("exemplo") ||
+    text.includes("generico") ||
+    text.includes("placeholder") ||
+    /^0+$/.test(digits) ||
+    /^7890+$/.test(digits) ||
+    digits === "7890000000000" ||
+    digits === "1234567890123"
+  );
+}
+
+function normalizeEanSuggestion(value, fallback = "") {
+  const fallbackDigits = cleanFiscalCode(fallback);
+  if (isPlaceholderEan(value)) return fallbackDigits;
+  const digits = cleanFiscalCode(value);
+  return [8, 12, 13, 14].includes(digits.length) ? digits : fallbackDigits;
+}
+
 function buildDefaultProductProfile(context = {}, ai = {}) {
   const product = context.product || {};
   const profile = ai.product_profile || {};
@@ -3677,7 +3830,7 @@ function normalizeSmartQuestions(ai = {}, context = {}, confidence = 0) {
       question: asCleanString(item?.question),
       options: asStringArray(item?.options, 4),
       reason: asCleanString(item?.reason),
-      blocks_auto_apply: Boolean(item?.blocks_auto_apply)
+      blocks_auto_apply: false
     }))
       .filter((item) => item.question)
       .slice(0, 3);
@@ -3689,7 +3842,7 @@ function normalizeSmartQuestions(ai = {}, context = {}, confidence = 0) {
       question: `Complete a descricao com: ${missing.join(", ")}.`,
       options: missing,
       reason: "Essas informacoes podem mudar o NCM ou o enquadramento fiscal.",
-      blocks_auto_apply: true
+      blocks_auto_apply: false
     });
   }
 
@@ -3698,8 +3851,8 @@ function normalizeSmartQuestions(ai = {}, context = {}, confidence = 0) {
       field: "produto",
       question: "Informe composicao, material, finalidade ou funcionamento do produto para aumentar a precisao fiscal.",
       options: ["Adicionar detalhes tecnicos", "Manter para revisao manual"],
-      reason: "A confianca ficou abaixo de 90%.",
-      blocks_auto_apply: true
+      reason: "A confianca pode melhorar com mais detalhes.",
+      blocks_auto_apply: false
     });
   }
 
@@ -3732,7 +3885,7 @@ function buildBackendBlockingQuestions(context = {}, profile = {}, confidence = 
       question: "Informe composicao, material, finalidade ou funcionamento do produto.",
       options: ["Adicionar detalhes tecnicos", "Manter para revisao manual"],
       reason: "Descricao muito curta para escolher uma NCM com seguranca.",
-      blocks_auto_apply: true
+      blocks_auto_apply: false
     });
   }
 
@@ -3742,7 +3895,7 @@ function buildBackendBlockingQuestions(context = {}, profile = {}, confidence = 
       question: "Complete as caracteristicas fiscais faltantes do produto.",
       options: missing.slice(0, 4),
       reason: "As caracteristicas faltantes podem mudar NCM, CEST ou tratamento fiscal.",
-      blocks_auto_apply: true
+      blocks_auto_apply: false
     });
   }
 
@@ -3756,7 +3909,7 @@ function buildBackendBlockingQuestions(context = {}, profile = {}, confidence = 
       question: "O cabo possui condutores eletricos, transmite dados/energia ou e fibra optica?",
       options: ["Condutor eletrico/dados", "Fibra optica", "Outro tipo de cabo"],
       reason: "Cabos eletricos, cabos de dados e cabos de fibra optica podem cair em posicoes NCM diferentes.",
-      blocks_auto_apply: true
+      blocks_auto_apply: false
     });
   }
 
@@ -3766,7 +3919,7 @@ function buildBackendBlockingQuestions(context = {}, profile = {}, confidence = 
       question: "O lapis e escolar/grafite, de cor, maquiagem ou uso tecnico?",
       options: ["Escolar/grafite", "De cor", "Maquiagem/uso cosmetico", "Uso tecnico"],
       reason: "A palavra lapis sozinha pode representar mercadorias fiscais diferentes.",
-      blocks_auto_apply: true
+      blocks_auto_apply: false
     });
   }
 
@@ -3776,7 +3929,7 @@ function buildBackendBlockingQuestions(context = {}, profile = {}, confidence = 
       question: "Qual e o tipo do queijo?",
       options: ["Minas frescal", "Mussarela", "Prato/parmesao", "Outro queijo"],
       reason: "O tipo do queijo pode alterar o enquadramento dentro da posicao 0406.",
-      blocks_auto_apply: true
+      blocks_auto_apply: false
     });
   }
 
@@ -3786,7 +3939,7 @@ function buildBackendBlockingQuestions(context = {}, profile = {}, confidence = 
       question: "A racao e destinada a qual animal?",
       options: ["Gatos", "Caes", "Aves/peixes", "Outro animal"],
       reason: "A especie de destino ajuda a validar NCM e possivel CEST.",
-      blocks_auto_apply: true
+      blocks_auto_apply: false
     });
   }
 
@@ -3799,7 +3952,7 @@ function buildBackendBlockingQuestions(context = {}, profile = {}, confidence = 
       question: "O oculos VR e autonomo, periferico de computador/console ou depende de smartphone?",
       options: ["Autonomo", "Periferico de computador/console", "Depende de smartphone"],
       reason: "O funcionamento do equipamento pode mudar o enquadramento fiscal.",
-      blocks_auto_apply: true
+      blocks_auto_apply: false
     });
   }
 
@@ -3848,7 +4001,7 @@ function addDetailQuestion(detailQuestions, question) {
     label: question.label,
     options: asStringArray(question.options, 8),
     required_for: asCleanString(question.required_for, "descricao fiscal"),
-    blocks_auto_apply: Boolean(question.blocks_auto_apply)
+    blocks_auto_apply: false
   });
 }
 
@@ -4016,24 +4169,14 @@ function buildSpecificationMenu(context = {}, profile = {}, questions = []) {
     }
   }
 
-  const officialCandidates = (context.ncm_policy?.allowed_ncms || [])
-    .slice(0, 8)
-    .map((item) => ({
-      ncm: item.codigo,
-      descricao: item.descricao,
-      sources: item.sources || [],
-      evidence_count: item.evidence_count || 0
-    }));
-
   return {
-    visible: Boolean(productOptions.length || detailQuestions.length || officialCandidates.length),
+    visible: Boolean(productOptions.length || detailQuestions.length),
     title: "Especificar produto",
     description:
       "Escolha a alternativa que melhor descreve o produto e complete os detalhes comerciais quando fizer sentido.",
     base_description: baseDescription,
     product_options: productOptions.slice(0, 8),
-    detail_questions: detailQuestions.slice(0, 3),
-    official_candidates: officialCandidates
+    detail_questions: detailQuestions.slice(0, 3)
   };
 }
 
@@ -4063,44 +4206,67 @@ function normalizeSources(sources = [], code = "", context = {}) {
 }
 
 function buildFieldSuggestions(ai = {}, context = {}, code = "", description = "", confidence = 0) {
-  const suggestion = ai.field_suggestions || {};
+  const fiscal = aiFiscalData(ai);
+  const suggestion = {
+    ...(ai.field_suggestions || {}),
+    ncm_description: fiscalText(fiscal.descricao, ai.field_suggestions?.ncm_description),
+    sku: fiscalText(fiscal.sku, ai.field_suggestions?.sku),
+    ean: fiscalText(fiscal.ean_gtin || fiscal.ean || fiscal.codigo_barras, ai.field_suggestions?.ean),
+    unidade: fiscalText(fiscal.unidade, ai.field_suggestions?.unidade),
+    cest: fiscalText(fiscal.cest, fiscalText(ai.cest_possivel, ai.field_suggestions?.cest)),
+    cfop_internal: fiscalText(fiscal.cfop_interno, ai.field_suggestions?.cfop_internal),
+    cfop_interstate: fiscalText(fiscal.cfop_interestadual, ai.field_suggestions?.cfop_interstate),
+    cst_icms: fiscalText(fiscal.cst_icms, ai.field_suggestions?.cst_icms),
+    csosn: fiscalText(fiscal.csosn, ai.field_suggestions?.csosn),
+    aliquota_icms: fiscalText(fiscal.aliquota_icms, ai.field_suggestions?.aliquota_icms),
+    icms_st: fiscalText(fiscal.icms_st, ai.field_suggestions?.icms_st),
+    origem: fiscalText(fiscal.origem, ai.field_suggestions?.origem),
+    cst_pis: fiscalText(fiscal.cst_pis, ai.field_suggestions?.cst_pis),
+    aliquota_pis: fiscalText(fiscal.aliquota_pis, ai.field_suggestions?.aliquota_pis),
+    cst_cofins: fiscalText(fiscal.cst_cofins, ai.field_suggestions?.cst_cofins),
+    aliquota_cofins: fiscalText(fiscal.aliquota_cofins, ai.field_suggestions?.aliquota_cofins),
+    aliquota_fcp: fiscalText(fiscal.aliquota_fcp, ai.field_suggestions?.aliquota_fcp),
+    ibs_cbs_cst: fiscalText(fiscal.ibs_cbs_cst, ai.field_suggestions?.ibs_cbs_cst),
+    cclass_trib: fiscalText(fiscal.cclass_trib, ai.field_suggestions?.cclass_trib),
+    aliquota_ibs_uf: fiscalText(fiscal.aliquota_ibs_uf, ai.field_suggestions?.aliquota_ibs_uf),
+    aliquota_ibs_municipio: fiscalText(fiscal.aliquota_ibs_municipio, ai.field_suggestions?.aliquota_ibs_municipio),
+    aliquota_cbs: fiscalText(fiscal.aliquota_cbs, ai.field_suggestions?.aliquota_cbs),
+    cst_ipi: fiscalText(fiscal.cst_ipi, ai.field_suggestions?.cst_ipi),
+    ipi: fiscalText(fiscal.aliquota_ipi || fiscal.ipi, ai.field_suggestions?.ipi),
+    ex_tipi: fiscalText(fiscal.ex_tipi, ai.field_suggestions?.ex_tipi),
+    cenq: fiscalText(fiscal.cenq, ai.field_suggestions?.cenq),
+    cbenef: fiscalText(fiscal.cbenef, ai.field_suggestions?.cbenef),
+    vtottrib: fiscalText(fiscal.vtottrib, ai.field_suggestions?.vtottrib),
+    observations: asStringArray([fiscal.observacao, ...asStringArray(ai.field_suggestions?.observations, 6)], 6)
+  };
   const trustedCode = normalizeNcmCode(code);
   const hasTrustedNcm = Boolean(trustedCode && trustedCode !== "00000000");
-  const tables =
-    hasTrustedNcm
-      ? getFiscalTablesForNcm(trustedCode)
-      : { cest: [], tipi: [], pis_cofins: [], cbenef: [], ibs_cbs_cst: [], ibs_cbs_classificacao: [] };
-  const localCest = tables.cest?.[0]?.codigo_cest || "";
   const webCest = hasTrustedNcm ? getCestsFromWebEvidence(context.web_evidence)[0]?.codigo || "" : "";
   const webNoCest = hasTrustedNcm ? webEvidenceSaysNoCest(context.web_evidence) : false;
-  const rawCestRequired = normalizeSimNaoIncerto(suggestion.cest_required, webNoCest ? "nao" : webCest || localCest ? "sim" : "incerto");
+  const rawCestRequired = normalizeSimNaoIncerto(suggestion.cest_required, webNoCest ? "nao" : webCest || suggestion.cest ? "sim" : "incerto");
   const cestRequired = isNoCestSignal(suggestion.cest, rawCestRequired) ? "nao" : rawCestRequired;
-  const cest = normalizeCestSuggestion(suggestion.cest || webCest || localCest, cestRequired);
+  const cest = normalizeCestSuggestion(suggestion.cest || webCest, cestRequired);
   const icmsSt = normalizeSimNaoIncerto(
     suggestion.icms_st,
-    cestRequired === "nao" ? "nao" : cest || localCest || webCest ? "sim" : "incerto"
+    cestRequired === "nao" ? "nao" : cest || webCest ? "sim" : "incerto"
   );
   const cfopInternal = asCleanString(suggestion.cfop_internal, context.operation?.cfop_interno_default || "");
   const cfopInterstate = asCleanString(suggestion.cfop_interstate, context.operation?.cfop_interestadual_default || "");
-  const pisCofins = trustedCode && trustedCode !== "00000000" ? getPisCofins(trustedCode) : null;
-  const tipiRow = tables.tipi?.[0] || null;
 
   return {
     ncm: trustedCode && trustedCode !== "00000000" ? trustedCode : "00000000",
     ncm_description: asCleanString(suggestion.ncm_description, description),
     sku: asCleanString(suggestion.sku, context.product?.codigo_produto || ""),
-    ean: asCleanString(suggestion.ean, context.product?.codigo_barras || ""),
+    ean: normalizeEanSuggestion(suggestion.ean, context.product?.codigo_barras || ""),
     unidade: asCleanString(suggestion.unidade, context.product?.unidade || ""),
     cest: cestRequired === "nao" ? "SEM CEST OBRIGATORIO" : cest,
     cest_required: cestRequired,
-    cest_confidence: clampScore(suggestion.cest_confidence, webCest ? 0.82 : localCest ? 0.72 : webNoCest ? 0.78 : 0.35),
+    cest_confidence: clampScore(suggestion.cest_confidence, webCest || suggestion.cest ? 0.82 : webNoCest ? 0.78 : 0.35),
     cest_reason: asCleanString(
       suggestion.cest_reason,
       cestRequired === "nao"
         ? "Pesquisa/evidencia nao indicou CEST obrigatorio especifico."
-        : localCest
-          ? "CEST encontrado em tabela local pelo NCM."
-          : "CEST depende de tabela por segmento/mercadoria e precisa de revisao."
+        : "CEST depende da evidencia web, UF, segmento e mercadoria."
     ),
     cfop_internal: cfopInternal,
     cfop_interstate: cfopInterstate,
@@ -4122,27 +4288,32 @@ function buildFieldSuggestions(ai = {}, context = {}, code = "", description = "
           : "ICMS-ST depende de NCM, CEST, UF, segmento e operacao."
     ),
     origem: asCleanString(suggestion.origem, "0"),
-    cst_pis: asCleanString(suggestion.cst_pis, getPisCofinsCst(pisCofins)),
-    aliquota_pis: numberOrFallback(suggestion.aliquota_pis, pisCofins?.aliquota_pis),
+    cst_pis: asCleanString(suggestion.cst_pis),
+    aliquota_pis: numberOrFallback(suggestion.aliquota_pis, null),
     pis_cofins_reason: asCleanString(
       suggestion.pis_cofins_reason,
-      pisCofins?.tipo_incidencia ? `Tabela PIS/COFINS local por NCM: ${pisCofins.tipo_incidencia}.` : "PIS/COFINS precisa de validacao por NCM/regime."
+      "PIS/COFINS preenchido somente quando retornado pela pesquisa fiscal."
     ),
-    cst_cofins: asCleanString(suggestion.cst_cofins, getPisCofinsCst(pisCofins)),
-    aliquota_cofins: numberOrFallback(suggestion.aliquota_cofins, pisCofins?.aliquota_cofins),
+    cst_cofins: asCleanString(suggestion.cst_cofins),
+    aliquota_cofins: numberOrFallback(suggestion.aliquota_cofins, null),
     aliquota_fcp: numberOrFallback(suggestion.aliquota_fcp, null),
-    ibs_cbs_cst: nonGenericFiscalValue(suggestion.ibs_cbs_cst, ["000"]),
-    cclass_trib: nonGenericFiscalValue(suggestion.cclass_trib, ["000001"]),
+    ibs_cbs_cst: asCleanString(suggestion.ibs_cbs_cst),
+    cclass_trib: asCleanString(suggestion.cclass_trib),
+    aliquota_ibs_uf: numberOrFallback(suggestion.aliquota_ibs_uf, null),
+    aliquota_ibs_municipio: numberOrFallback(suggestion.aliquota_ibs_municipio, null),
+    aliquota_cbs: numberOrFallback(suggestion.aliquota_cbs, null),
     ibs_cbs_reason: asCleanString(
       suggestion.ibs_cbs_reason,
       "IBS/CBS deve ser cruzado com NCM, LC 214/2025, reducoes, aliquota zero e cClassTrib vigente."
     ),
-    ipi: asCleanString(suggestion.ipi, tipiRow?.aliquota_ipi ?? ""),
+    cst_ipi: asCleanString(suggestion.cst_ipi),
+    ipi: asCleanString(suggestion.ipi),
     ipi_reason: asCleanString(
       suggestion.ipi_reason,
-      tipiRow ? "IPI encontrado em tabela TIPI local pelo NCM." : "IPI/EX TIPI precisa de consulta TIPI por NCM."
+      "IPI/EX TIPI preenchido somente quando retornado pela pesquisa fiscal."
     ),
-    ex_tipi: asCleanString(suggestion.ex_tipi, tipiRow?.ex_tipi || ""),
+    ex_tipi: asCleanString(suggestion.ex_tipi),
+    cenq: asCleanString(suggestion.cenq),
     cbenef: asCleanString(suggestion.cbenef),
     benefit_reason: asCleanString(
       suggestion.benefit_reason,
@@ -4183,12 +4354,6 @@ function buildFiscalLayers(ai = {}, context = {}, fieldSuggestions = {}, profile
 function buildWhy(ai = {}, context = {}, code = "", description = "", questions = []) {
   const why = ai.why || {};
   const alternatives = asStringArray(why.discarded_alternatives, 6);
-  if (!alternatives.length) {
-    for (const candidate of (context.candidates || []).slice(0, 4)) {
-      const candidateCode = normalizeNcmCode(candidate?.codigo);
-      if (candidateCode && candidateCode !== code) alternatives.push(`${candidateCode} - ${candidate.descricao || "alternativa descartada"}`);
-    }
-  }
   return {
     identified_as: asCleanString(
       why.identified_as,
@@ -4197,7 +4362,7 @@ function buildWhy(ai = {}, context = {}, code = "", description = "", questions 
     official_basis: asCleanString(why.official_basis, description ? `NCM oficial: ${description}` : "Base oficial/local NCM e evidencia web consultadas."),
     evidence_summary: asCleanString(
       why.evidence_summary,
-      asCleanString(ai.justificativa_curta, asCleanString(ai.reason, "Classificacao feita por candidatos oficiais, tabelas locais e pesquisa web."))
+      asCleanString(ai.justificativa_curta, asCleanString(ai.reason, "Classificacao feita por pesquisa web fiscal e referencias oficiais quando disponiveis."))
     ),
     discarded_alternatives: alternatives.slice(0, 6),
     review_recommendation: asCleanString(
@@ -4309,7 +4474,7 @@ function buildNcmDecisionPolicy(context = {}) {
     source: NCM_JSON_URL,
     table_version: context.ncm_catalog?.latest_start_date || "",
     apply_threshold: OPENAI_NCM_APPLY_THRESHOLD,
-    rule: "O NCM final deve existir na tabela oficial vigente e estar em allowed_ncms. allowed_ncms vazio significa ERRO_BASE_FISCAL, nao falta de especificacao do cliente.",
+    rule: "Web-first: allowed_ncms sao apoio local, nao bloqueio. O NCM pesquisado na web pode ser aplicado se tiver 8 digitos validos e nao for 00000000.",
     allowed_ncms: [...allowed.values()].slice(0, 18)
   };
 }
@@ -4369,10 +4534,6 @@ function validateAiResponseIdentity(ai = {}, context = {}) {
   return { ok: errors.length === 0, errors };
 }
 
-function hasAllowedNcmCandidates(context = {}) {
-  return Boolean((context.ncm_policy?.allowed_ncms || []).length);
-}
-
 function buildAiWarnings(ai, context, code) {
   const warnings = asStringArray(ai?.avisos || ai?.warnings, 8);
   const genericCandidate = [context.local_best, ...(context.candidates || [])].find(
@@ -4418,9 +4579,10 @@ function buildStructuredFiscalOutput(context = {}, result = {}) {
       cest: suggestions.cest || null,
       confianca_cest: fieldScores.cest || 0,
       ipi: {
-        cst: null,
+        cst: suggestions.cst_ipi || null,
         aliquota: suggestions.ipi || null,
-        ex_tipi: suggestions.ex_tipi || null
+        ex_tipi: suggestions.ex_tipi || null,
+        cenq: suggestions.cenq || null
       },
       unidade: suggestions.unidade || profile.unidade || context.product?.unidade || ""
     },
@@ -4447,7 +4609,10 @@ function buildStructuredFiscalOutput(context = {}, result = {}) {
       },
       ibs_cbs: {
         cst: suggestions.ibs_cbs_cst || null,
-        cclass_trib: suggestions.cclass_trib || null
+        cclass_trib: suggestions.cclass_trib || null,
+        aliquota_ibs_uf: suggestions.aliquota_ibs_uf ?? null,
+        aliquota_ibs_municipio: suggestions.aliquota_ibs_municipio ?? null,
+        aliquota_cbs: suggestions.aliquota_cbs ?? null
       },
       cbenef: suggestions.cbenef || null,
       vtottrib: suggestions.vtottrib || null
@@ -4489,6 +4654,38 @@ function buildTechnicalAiPayload(context = {}, status = "ERRO_VALIDACAO", reason
     confianca_cest: 0,
     especificacao_suficiente: false,
     faltando: details.faltando || [],
+    dados_fiscais: {
+      sku: context.product?.sku || context.product?.codigo_produto || "",
+      ean_gtin: context.product?.ean || context.product?.codigo_barras || "",
+      descricao: context.product?.descricao || "",
+      ncm: "00000000",
+      cest: "",
+      unidade: context.product?.unidade || "",
+      origem: "",
+      cfop_interno: context.operation?.cfop_interno_default || "",
+      cfop_interestadual: context.operation?.cfop_interestadual_default || "",
+      cst_icms: "",
+      csosn: "",
+      aliquota_icms: "",
+      icms_st: "",
+      aliquota_fcp: "",
+      cst_pis: "",
+      aliquota_pis: "",
+      cst_cofins: "",
+      aliquota_cofins: "",
+      cst_ipi: "",
+      aliquota_ipi: "",
+      ex_tipi: "",
+      cenq: "",
+      ibs_cbs_cst: "",
+      cclass_trib: "",
+      aliquota_ibs_uf: "",
+      aliquota_ibs_municipio: "",
+      aliquota_cbs: "",
+      cbenef: "",
+      vtottrib: "",
+      observacao: reason
+    },
     justificativa_curta: reason,
     status,
     fontes: [],
@@ -4499,20 +4696,20 @@ function buildTechnicalAiPayload(context = {}, status = "ERRO_VALIDACAO", reason
 function normalizeAiNcmResult(ai, context) {
   const aiStatus = normalizeAiClassificationStatus(ai?.status);
   const identity = validateAiResponseIdentity(ai, context);
-  const hasCandidates = hasAllowedNcmCandidates(context);
-  const aiNcm = normalizeNcmCode(ai?.ncm);
+  const fiscal = aiFiscalData(ai);
+  const aiNcm = normalizeNcmCode(ai?.ncm || fiscal.ncm);
   const aiReturnedNcm = aiNcm && aiNcm !== "00000000" ? aiNcm : "";
   const aiOfficial = aiReturnedNcm ? getOfficialNcmRow(aiReturnedNcm) : null;
-  const aiPolicyEntry = aiReturnedNcm ? findAllowedNcmPolicyEntry(context, aiReturnedNcm) : null;
-  const cleanNcm = aiPolicyEntry ? aiReturnedNcm : "";
+  const localReference = aiReturnedNcm ? findAllowedNcmPolicyEntry(context, aiReturnedNcm) : null;
+  const cleanNcm = aiReturnedNcm;
   const official = cleanNcm ? getOfficialNcmRow(cleanNcm) : null;
-  const policyEntry = cleanNcm ? findAllowedNcmPolicyEntry(context, cleanNcm) : null;
-  const sourceList = policyEntry?.sources || [];
-  const validNcm = Boolean(cleanNcm && cleanNcm.length === 8 && cleanNcm !== "00000000" && official);
-  const whitelistAllowed = Boolean(policyEntry);
+  const sourceList = localReference?.sources || [];
+  const validNcm = Boolean(cleanNcm && cleanNcm.length === 8 && cleanNcm !== "00000000");
+  const localReferenceAvailable = Boolean(localReference);
   const fromCandidates = sourceList.some((source) => ["candidate", "local_best"].includes(source));
   const fromAiSources = aiSourcesSupportNcm(ai?.fontes || ai?.sources || [], cleanNcm);
-  const invalidReturnedNcm = Boolean(aiReturnedNcm && (!aiOfficial || !aiPolicyEntry));
+  const fromWebEvidence = Boolean(webEvidenceSupportsNcm(context.web_evidence, cleanNcm) || fromAiSources);
+  const invalidReturnedNcm = Boolean(aiReturnedNcm && !validNcm);
   const confidence = clampConfidence(ai?.confianca_ncm ?? ai?.confidence);
   const productProfile = buildDefaultProductProfile(context, ai);
   let smartQuestions = mergeSmartQuestions(
@@ -4522,35 +4719,36 @@ function normalizeAiNcmResult(ai, context) {
   const blocksAutoApply = smartQuestions.some((item) => item.blocks_auto_apply);
   const explicitlyInsufficient = ai?.especificacao_suficiente === false || aiStatus === "REVISAO_ESPECIFICACAO";
   const insufficientInfo = Boolean(
-    explicitlyInsufficient ||
+    (!validNcm && explicitlyInsufficient) ||
       blocksAutoApply ||
-      (productProfile.missing_characteristics.length >= 3 && confidence < 0.93) ||
-      confidence < OPENAI_NCM_APPLY_THRESHOLD
+      (!validNcm && productProfile.missing_characteristics.length >= 3 && confidence < 0.75)
   );
-  const acceptedNcm = Boolean(identity.ok && hasCandidates && validNcm && whitelistAllowed && !invalidReturnedNcm);
+  const acceptedNcm = Boolean(identity.ok && validNcm && !invalidReturnedNcm);
   const outputNcm = acceptedNcm ? cleanNcm : "00000000";
-  const description = acceptedNcm ? official?.descricao || aiSourceDescription(ai?.fontes || ai?.sources || [], cleanNcm) || "" : "";
+  const description = acceptedNcm
+    ? official?.descricao || fiscalText(fiscal.descricao) || aiSourceDescription(ai?.fontes || ai?.sources || [], cleanNcm) || ""
+    : "";
   const warnings = buildAiWarnings(ai, context, cleanNcm);
   let status = aiStatus;
 
   if (!identity.ok) {
     status = "ERRO_VALIDACAO";
     warnings.unshift(...identity.errors);
-  } else if (!hasCandidates) {
-    status = "ERRO_BASE_FISCAL";
-    warnings.unshift("A busca local/oficial de NCM nao retornou candidatos para este produto.");
   } else if (invalidReturnedNcm) {
     status = "ERRO_VALIDACAO";
-    const message = aiOfficial
-      ? `NCM ${aiReturnedNcm} existe na tabela oficial, mas nao estava em allowed_ncms para este produto.`
-      : `NCM ${aiReturnedNcm} nao existe na tabela oficial vigente.`;
+    const message = `NCM retornado invalido: ${ai?.ncm || fiscal.ncm || "vazio"}.`;
     warnings.unshift(message);
+  } else if (acceptedNcm && !aiOfficial) {
+    const message = `NCM ${outputNcm} aplicado pela pesquisa web, mas nao localizado na base NCM oficial local.`;
+    if (!warnings.some((warning) => normalizeText(warning) === normalizeText(message))) warnings.unshift(message);
+  } else if (acceptedNcm && !["ERRO_BASE_FISCAL", "ERRO_OPENAI", "ERRO_VALIDACAO"].includes(status)) {
+    status = "CLASSIFICADO";
   } else if (status === "CLASSIFICADO" && insufficientInfo) {
     status = "REVISAO_ESPECIFICACAO";
   }
 
-  if (acceptedNcm && insufficientInfo) {
-    const message = "NCM encontrado, mas nao aplicado automaticamente porque a especificacao/confianca nao atingiu a politica minima.";
+  if (acceptedNcm && smartQuestions.length) {
+    const message = "NCM aplicado pela pesquisa web; perguntas ficam apenas como apoio para melhorar a descricao fiscal.";
     if (!warnings.some((warning) => normalizeText(warning) === normalizeText(message))) warnings.unshift(message);
   }
 
@@ -4561,7 +4759,7 @@ function normalizeAiNcmResult(ai, context) {
 
   const fieldSuggestions = buildFieldSuggestions(ai, context, outputNcm || "00000000", description, confidence);
   const fieldScores = buildFieldScores(ai, confidence);
-  const safeToApply = Boolean(status === "CLASSIFICADO" && acceptedNcm && confidence >= OPENAI_NCM_APPLY_THRESHOLD && !insufficientInfo);
+  const safeToApply = Boolean(status === "CLASSIFICADO" && acceptedNcm);
   const result = {
     request_id: context.request_id || "",
     sku: context.product?.sku || context.product?.codigo_produto || "",
@@ -4590,15 +4788,16 @@ function normalizeAiNcmResult(ai, context) {
       request_id_returned: ai?.request_id || null,
       request_id_ok: identity.ok,
       exists_in_official: Boolean(official),
-      whitelist_allowed: whitelistAllowed,
+      local_reference_available: localReferenceAvailable,
+      web_first_policy: true,
       from_candidates: fromCandidates,
-      from_web_evidence: Boolean(webEvidenceSupportsNcm(context.web_evidence, outputNcm)),
+      from_web_evidence: fromWebEvidence,
       from_ai_sources: fromAiSources,
       threshold: OPENAI_NCM_APPLY_THRESHOLD,
       blocks_auto_apply: blocksAutoApply,
       insufficient_info: insufficientInfo,
       researched_ncm: acceptedNcm,
-      auto_apply_source_allowed: fromCandidates,
+      auto_apply_source_allowed: true,
       returned_ncm: aiReturnedNcm || null,
       selected_ncm: outputNcm !== "00000000" ? outputNcm : null,
       rejected_ncm: outputNcm === "00000000" && aiReturnedNcm ? aiReturnedNcm : null,
@@ -4613,38 +4812,10 @@ async function prepareAiNcmContext(classification, options = {}) {
   return attachNcmDecisionPolicy(await buildAiNcmContext(classification, { ...options, use_web: false, useWeb: false }));
 }
 
-function buildBaseFiscalErrorAiCheck(enrichedContext, options = {}) {
-  const result = normalizeAiNcmResult(
-    buildTechnicalAiPayload(
-      enrichedContext,
-      "ERRO_BASE_FISCAL",
-      "A busca local/oficial de NCM nao retornou candidatos. Reforce a base NCM antes de consultar a OpenAI.",
-      { faltando: ["candidatos_ncm_backend"], avisos: ["allowed_ncms veio vazio."] }
-    ),
-    enrichedContext
-  );
-  return {
-    checked_at: now(),
-    provider: "backend",
-    model: null,
-    response_id: null,
-    usage: null,
-    parse_error: null,
-    context: enrichedContext,
-    result,
-    billing: options.billing || null,
-    message: "Auto classificacao bloqueada: a base fiscal nao retornou candidatos NCM para este produto.",
-    policy: "allowed_ncms vazio vira ERRO_BASE_FISCAL, nao consome chamada OpenAI e nao entra na cobranca da consulta."
-  };
-}
-
 async function buildAiNcmSuggestion(classification, options = {}) {
   const enrichedContext = options.context?.ncm_policy
     ? options.context
     : attachNcmDecisionPolicy(await buildAiNcmContext(classification, options));
-  if (!hasAllowedNcmCandidates(enrichedContext)) {
-    return buildBaseFiscalErrorAiCheck(enrichedContext, options);
-  }
 
   let response;
   try {
@@ -4706,7 +4877,7 @@ async function buildAiNcmSuggestion(classification, options = {}) {
     message: result.eligible_to_apply
       ? `Classificador automatico aplicou ${result.ncm} com ${Math.round(result.confidence * 100)}% de confianca.`
       : `Classificador automatico deixou para revisao: ${result.reason || result.status || "sem confianca suficiente."}`,
-    policy: "Uma chamada OpenAI stateless por produto. O backend valida request_id, whitelist NCM e monta os campos fiscais determinísticos."
+    policy: "Uma chamada OpenAI stateless por produto. O backend valida request_id/NCM valido e grava os campos fiscais pesquisados, sem aprendizado e sem referencia local obrigatoria."
   };
 }
 
@@ -4739,7 +4910,7 @@ function trustedPreviousIbsCbsValue(previous, field) {
 function resolveIbsCbsPatch(previous, suggested = {}) {
   const suggestedCst = asCleanString(suggested.ibs_cbs_cst);
   const suggestedClass = asCleanString(suggested.cclass_trib);
-  if (suggestedCst && suggestedClass && !isGenericIbsCbsPair(suggestedCst, suggestedClass)) {
+  if (suggestedCst && suggestedClass) {
     return { ibs_cbs_cst: suggestedCst, cclass_trib: suggestedClass };
   }
   return {
@@ -4753,32 +4924,22 @@ function buildFiscalPatchFromNcm(previous, ncm, aiResult = null) {
   const company = getCompanyForFiscalUf(fiscalUf);
   const operation = getOperationForClassification(previous);
   const cfops = getCfopPair(operation, company);
-  const tables = getFiscalTablesForNcm(ncm);
-  const pisCofins = getPisCofins(ncm);
-  const pisCofinsCst = getPisCofinsCst(pisCofins);
-  const cbenef = pickFiscalBenefit(tables, company);
-  const simples = company.regime_tributario === "simples_nacional" || company.crt === "1" || company.crt === "4";
-  const cstIcms = cbenef?.cst || previous.cst_icms || "00";
   const suggested = aiResult?.field_suggestions || {};
   const ibsCbsPatch = resolveIbsCbsPatch(previous, suggested);
   const suggestedCest = normalizeCestSuggestion(suggested.cest, suggested.cest_required);
   const noCestRequired = isNoCestSignal(suggestedCest, suggested.cest_required);
-  const finalCest = noCestRequired
-    ? "SEM CEST OBRIGATORIO"
-    : suggestedCest || tables.cest?.[0]?.codigo_cest || previous.cest;
+  const finalCest = noCestRequired ? "SEM CEST OBRIGATORIO" : suggestedCest || null;
   const finalIcmsSt = normalizeSimNaoIncerto(
     suggested.icms_st,
-    noCestRequired ? "nao" : finalCest && finalCest !== "SEM CEST OBRIGATORIO" ? "sim" : previous.icms_st || "incerto"
+    noCestRequired ? "nao" : finalCest && finalCest !== "SEM CEST OBRIGATORIO" ? "sim" : "incerto"
   );
   const finalCfopInterno = asCleanString(suggested.cfop_internal, cfops.interno);
   const finalCfopInterestadual = asCleanString(suggested.cfop_interstate, cfops.interestadual);
-  const finalPis = asCleanString(suggested.cst_pis, pisCofinsCst || previous.cst_pis);
-  const finalCofins = asCleanString(suggested.cst_cofins, pisCofinsCst || previous.cst_cofins);
+  const finalPis = asCleanString(suggested.cst_pis);
+  const finalCofins = asCleanString(suggested.cst_cofins);
   const suggestedCsosn = asCleanString(suggested.csosn);
   const suggestedCstIcms = asCleanString(suggested.cst_icms);
-  const finalCsosn = simples
-    ? suggestedCsosn || (String(cstIcms) === "60" || (tables.cest?.length && !noCestRequired) ? "500" : previous.csosn || "102")
-    : null;
+  const finalCsosn = suggestedCsosn || null;
 
   return {
     unidade: asCleanString(suggested.unidade, previous.unidade || null),
@@ -4788,22 +4949,27 @@ function buildFiscalPatchFromNcm(previous, ncm, aiResult = null) {
     cest: finalCest,
     cfop_interno: finalCfopInterno,
     cfop_interestadual: finalCfopInterestadual,
-    cst_icms: simples ? null : suggestedCstIcms || cstIcms,
-    aliquota_icms: numberOrFallback(suggested.aliquota_icms, previous.aliquota_icms),
+    cst_icms: suggestedCstIcms || null,
+    aliquota_icms: numberOrFallback(suggested.aliquota_icms, null),
     icms_st: finalIcmsSt,
     csosn: finalCsosn,
-    origem: asCleanString(suggested.origem, previous.origem || "0"),
+    origem: asCleanString(suggested.origem),
     cst_pis: finalPis,
-    aliquota_pis: numberOrFallback(suggested.aliquota_pis, pisCofins?.aliquota_pis ?? previous.aliquota_pis),
+    aliquota_pis: numberOrFallback(suggested.aliquota_pis, null),
     cst_cofins: finalCofins,
-    aliquota_cofins: numberOrFallback(suggested.aliquota_cofins, pisCofins?.aliquota_cofins ?? previous.aliquota_cofins),
-    aliquota_fcp: numberOrFallback(suggested.aliquota_fcp, previous.aliquota_fcp),
+    aliquota_cofins: numberOrFallback(suggested.aliquota_cofins, null),
+    aliquota_fcp: numberOrFallback(suggested.aliquota_fcp, null),
     ibs_cbs_cst: ibsCbsPatch.ibs_cbs_cst,
     cclass_trib: ibsCbsPatch.cclass_trib,
-    ipi: asCleanString(suggested.ipi, tables.tipi?.[0]?.aliquota_ipi ?? previous.ipi),
-    ex_tipi: asCleanString(suggested.ex_tipi, tables.tipi?.[0]?.ex_tipi || previous.ex_tipi),
-    cbenef: asCleanString(suggested.cbenef, cbenef?.codigo_beneficio || previous.cbenef),
-    vtottrib: getIbptEstimate(ncm, company, previous.preco) ?? previous.vtottrib
+    aliquota_ibs_uf: numberOrFallback(suggested.aliquota_ibs_uf, null),
+    aliquota_ibs_municipio: numberOrFallback(suggested.aliquota_ibs_municipio, null),
+    aliquota_cbs: numberOrFallback(suggested.aliquota_cbs, null),
+    cst_ipi: asCleanString(suggested.cst_ipi),
+    ipi: asCleanString(suggested.ipi),
+    ex_tipi: asCleanString(suggested.ex_tipi),
+    cenq: asCleanString(suggested.cenq),
+    cbenef: asCleanString(suggested.cbenef),
+    vtottrib: numberOrFallback(suggested.vtottrib, null)
   };
 }
 
@@ -4827,7 +4993,8 @@ function updateClassificationAiNcm(id, aiCheck, options = {}, actor = "contador"
       sku = ?, ean = ?, ncm = ?, cest = ?, cfop_interno = ?, cfop_interestadual = ?,
       cst_icms = ?, aliquota_icms = ?, icms_st = ?, csosn = ?, origem = ?, cst_pis = ?,
       aliquota_pis = ?, cst_cofins = ?, aliquota_cofins = ?, aliquota_fcp = ?,
-      ibs_cbs_cst = ?, cclass_trib = ?, ipi = ?, ex_tipi = ?, cbenef = ?, vtottrib = ?,
+      ibs_cbs_cst = ?, cclass_trib = ?, aliquota_ibs_uf = ?, aliquota_ibs_municipio = ?, aliquota_cbs = ?,
+      cst_ipi = ?, ipi = ?, ex_tipi = ?, cenq = ?, cbenef = ?, vtottrib = ?,
       confianca = ?, status = ?, observacao = ?, sugestao_json = ?, updated_at = ?
     WHERE id = ?
   `
@@ -4850,8 +5017,13 @@ function updateClassificationAiNcm(id, aiCheck, options = {}, actor = "contador"
     fiscalPatch.aliquota_fcp,
     fiscalPatch.ibs_cbs_cst,
     fiscalPatch.cclass_trib,
+    fiscalPatch.aliquota_ibs_uf,
+    fiscalPatch.aliquota_ibs_municipio,
+    fiscalPatch.aliquota_cbs,
+    fiscalPatch.cst_ipi,
     fiscalPatch.ipi,
     fiscalPatch.ex_tipi,
+    fiscalPatch.cenq,
     fiscalPatch.cbenef,
     fiscalPatch.vtottrib,
     Number(confidence || 0),
@@ -4867,7 +5039,7 @@ function updateClassificationAiNcm(id, aiCheck, options = {}, actor = "contador"
 
   const updated = getClassification(id);
   logAudit("classification", id, "openai_ncm_check", actor, previous, updated, {
-    source_table: "openai_responses+ncm_oficial",
+    source_table: "openai_responses+web_search",
     table_version: aiCheck.model,
     effective_date: aiCheck.checked_at?.slice(0, 10)
   });
@@ -4899,9 +5071,6 @@ async function checkClassificationAiNcm(id, options = {}, actor = "contador") {
   const previous = getClassification(id);
   if (!previous) return null;
   const context = options.context?.ncm_policy ? options.context : await prepareAiNcmContext(previous, options);
-  if (!hasAllowedNcmCandidates(context)) {
-    return updateClassificationAiNcm(id, buildBaseFiscalErrorAiCheck(context, options), options, actor);
-  }
   const billing = options.skip_billing
     ? options.billing || null
     : await resolveAiBillingForUse({ classificationId: id, quantity: 1, actor, context: "item", options });
@@ -4935,17 +5104,11 @@ async function checkReviewTableAiNcm(options = {}, actor = "contador") {
   const limit = Math.min(Math.max(Number(options.limit || 100), 1), 500);
   const rows = db.prepare("SELECT id FROM classifications WHERE status != 'approved' ORDER BY id LIMIT ?").all(limit);
   const aiJobs = [];
-  const preflightResults = [];
 
   for (const row of rows) {
     const previous = getClassification(row.id);
     if (!previous) continue;
     const context = await prepareAiNcmContext(previous, options);
-    if (!hasAllowedNcmCandidates(context)) {
-      const updated = updateClassificationAiNcm(row.id, buildBaseFiscalErrorAiCheck(context, options), options, actor);
-      if (updated) preflightResults.push({ updated, preflight: true });
-      continue;
-    }
     aiJobs.push({ id: row.id, context });
   }
 
@@ -4957,19 +5120,15 @@ async function checkReviewTableAiNcm(options = {}, actor = "contador") {
         paid: true,
         requires_payment: false,
         quantity: 0,
-        amount_cents: 0,
-        amount_brl: 0
+      amount_cents: 0,
+      amount_brl: 0
       };
   if (billing?.enabled && billing.requires_payment) {
     logAudit("review_table", null, "openai_ncm_billing", actor, { total: rows.length, billable: aiJobs.length }, { billing });
     return {
-      checked: preflightResults.length,
+      checked: 0,
       applied: 0,
-      counts: preflightResults.reduce((acc, result) => {
-        const status = result.updated?.sugestao?.ai_ncm?.result?.status || "unknown";
-        acc[status] = (acc[status] || 0) + 1;
-        return acc;
-      }, {}),
+      counts: {},
       payment_required: true,
       openai: aiNcmConfig(),
       billing,
@@ -5042,7 +5201,7 @@ async function checkReviewTableAiNcm(options = {}, actor = "contador") {
   const items = [];
   const counts = {};
   let applied = 0;
-  for (const result of [...preflightResults, ...results]) {
+  for (const result of results) {
     if (result?.error) {
       counts.error = (counts.error || 0) + 1;
       continue;
@@ -5067,7 +5226,6 @@ async function checkReviewTableAiNcm(options = {}, actor = "contador") {
     applied,
     counts,
     unpaidItems,
-    baseErrorItems: preflightResults.length,
     billableItems: aiJobs.length
   });
   return {
@@ -5078,7 +5236,7 @@ async function checkReviewTableAiNcm(options = {}, actor = "contador") {
     concurrency: concurrency || 1,
     paid_items: billableRows.length,
     unpaid_items: unpaidItems,
-    base_error_items: preflightResults.length,
+    base_error_items: 0,
     openai: aiNcmConfig(),
     billing: billing?.event_id ? publicBillingFromEvent(getAiBillingEvent(billing.event_id)) : billing,
     items
@@ -5466,26 +5624,20 @@ function classifyProduct(product, operationType = "venda", uf = "") {
   const company = getCompanyForFiscalUf(fiscalUf);
   const operation = normalizeOperationType(operationType);
   const tokens = extractTokens(`${product.descricao_original} ${product.marca || ""} ${product.categoria || ""}`);
-  const validated = null;
-  const ncmMatch = findNcmMatch(product, tokens);
   const cfops = getCfopPair(operation, company);
-  const pisCofins = getPisCofins(ncmMatch.codigo);
 
   const confidenceParts = [
-    ncmMatch.score,
-    validated ? validated.score : 0,
-    product.ncm_importado ? 0.1 : 0,
     product.codigo_barras ? 0.04 : 0,
     product.categoria ? 0.04 : 0
   ];
-  const confidence = Math.min(0.98, Math.max(0.18, confidenceParts.reduce((sum, item) => sum + item, 0)));
+  const confidence = Math.min(0.3, Math.max(0.05, confidenceParts.reduce((sum, item) => sum + item, 0)));
 
   return {
     operation_type: operation,
     uf: fiscalUf,
     sku: product.codigo_produto || null,
     ean: product.codigo_barras || null,
-    ncm: ncmMatch.codigo,
+    ncm: "00000000",
     cest: null,
     cfop_interno: cfops.interno,
     cfop_interestadual: cfops.interestadual,
@@ -5494,15 +5646,20 @@ function classifyProduct(product, operationType = "venda", uf = "") {
     icms_st: "incerto",
     csosn: null,
     origem: "0",
-    cst_pis: getPisCofinsCst(pisCofins) || null,
-    aliquota_pis: numberOrFallback(pisCofins?.aliquota_pis, null),
-    cst_cofins: getPisCofinsCst(pisCofins) || null,
-    aliquota_cofins: numberOrFallback(pisCofins?.aliquota_cofins, null),
+    cst_pis: null,
+    aliquota_pis: null,
+    cst_cofins: null,
+    aliquota_cofins: null,
     aliquota_fcp: null,
     ibs_cbs_cst: null,
     cclass_trib: null,
+    aliquota_ibs_uf: null,
+    aliquota_ibs_municipio: null,
+    aliquota_cbs: null,
+    cst_ipi: null,
     ipi: null,
     ex_tipi: null,
+    cenq: null,
     cbenef: null,
     vtottrib: null,
     confianca: Number(confidence.toFixed(2)),
@@ -5510,7 +5667,7 @@ function classifyProduct(product, operationType = "venda", uf = "") {
     observacao: "Pre-classificacao inicial sem aprendizado legado. Use Auto Classificar Produtos para completar os campos fiscais com contexto de UF.",
     sugestao_json: {
       tokens,
-      ncm: ncmMatch,
+      ncm: { codigo: "00000000", source: "web_first_pending" },
       aprendizado_legado: "disabled",
       empresa: {
         crt: company.crt,
@@ -5518,8 +5675,7 @@ function classifyProduct(product, operationType = "venda", uf = "") {
         uf: fiscalUf,
         contribuinte_icms: Boolean(company.contribuinte_icms)
       },
-      operacao: operation,
-      pis_cofins: pisCofins
+      operacao: operation
     }
   };
 }
@@ -5565,8 +5721,9 @@ function insertProduct(batchId, product, operationType, uf = "") {
       product_id, operation_type, uf, sku, ean, ncm, cest, cfop_interno, cfop_interestadual, cst_icms,
       aliquota_icms, icms_st, csosn, origem, cst_pis, aliquota_pis, cst_cofins, aliquota_cofins,
       aliquota_fcp, ibs_cbs_cst,
-      cclass_trib, ipi, ex_tipi, cbenef, vtottrib, confianca, status, observacao, sugestao_json, updated_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      cclass_trib, aliquota_ibs_uf, aliquota_ibs_municipio, aliquota_cbs, cst_ipi, ipi, ex_tipi, cenq,
+      cbenef, vtottrib, confianca, status, observacao, sugestao_json, updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `).run(
     productId,
     operation,
@@ -5589,8 +5746,13 @@ function insertProduct(batchId, product, operationType, uf = "") {
     classification.aliquota_fcp,
     classification.ibs_cbs_cst,
     classification.cclass_trib,
+    classification.aliquota_ibs_uf,
+    classification.aliquota_ibs_municipio,
+    classification.aliquota_cbs,
+    classification.cst_ipi,
     classification.ipi,
     classification.ex_tipi,
+    classification.cenq,
     classification.cbenef,
     classification.vtottrib,
     classification.confianca,
@@ -5662,8 +5824,13 @@ function rowToClassification(row) {
     aliquota_fcp: row.aliquota_fcp,
     ibs_cbs_cst: row.ibs_cbs_cst,
     cclass_trib: row.cclass_trib,
+    aliquota_ibs_uf: row.aliquota_ibs_uf,
+    aliquota_ibs_municipio: row.aliquota_ibs_municipio,
+    aliquota_cbs: row.aliquota_cbs,
+    cst_ipi: row.cst_ipi,
     ipi: row.ipi,
     ex_tipi: row.ex_tipi,
+    cenq: row.cenq,
     cbenef: row.cbenef,
     vtottrib: row.vtottrib,
     confianca: row.confianca,
@@ -5751,8 +5918,13 @@ function updateClassification(id, patch, actor = "contador") {
     "aliquota_fcp",
     "ibs_cbs_cst",
     "cclass_trib",
+    "aliquota_ibs_uf",
+    "aliquota_ibs_municipio",
+    "aliquota_cbs",
+    "cst_ipi",
     "ipi",
     "ex_tipi",
+    "cenq",
     "cbenef",
     "vtottrib",
     "confianca",
@@ -5772,7 +5944,7 @@ function updateClassification(id, patch, actor = "contador") {
     next.cfop_interno = cfops.interno;
     next.cfop_interestadual = cfops.interestadual;
     if (ufChanged) {
-      const stateFields = ["cest", "aliquota_icms", "aliquota_fcp", "cbenef", "vtottrib"];
+      const stateFields = ["cest", "aliquota_icms", "aliquota_fcp", "aliquota_ibs_uf", "aliquota_ibs_municipio", "cbenef", "vtottrib"];
       for (const field of stateFields) {
         if (!Object.prototype.hasOwnProperty.call(patch, field)) next[field] = null;
       }
@@ -5786,7 +5958,8 @@ function updateClassification(id, patch, actor = "contador") {
       operation_type = ?, uf = ?, sku = ?, ean = ?, ncm = ?, cest = ?, cfop_interno = ?, cfop_interestadual = ?,
       cst_icms = ?, aliquota_icms = ?, icms_st = ?, csosn = ?, origem = ?, cst_pis = ?,
       aliquota_pis = ?, cst_cofins = ?, aliquota_cofins = ?, aliquota_fcp = ?,
-      ibs_cbs_cst = ?, cclass_trib = ?, ipi = ?, ex_tipi = ?, cbenef = ?, vtottrib = ?,
+      ibs_cbs_cst = ?, cclass_trib = ?, aliquota_ibs_uf = ?, aliquota_ibs_municipio = ?, aliquota_cbs = ?,
+      cst_ipi = ?, ipi = ?, ex_tipi = ?, cenq = ?, cbenef = ?, vtottrib = ?,
       confianca = ?, status = ?, observacao = ?, updated_at = ?
     WHERE id = ?
   `).run(
@@ -5810,8 +5983,13 @@ function updateClassification(id, patch, actor = "contador") {
     next.aliquota_fcp,
     next.ibs_cbs_cst,
     next.cclass_trib,
+    next.aliquota_ibs_uf,
+    next.aliquota_ibs_municipio,
+    next.aliquota_cbs,
+    next.cst_ipi,
     next.ipi,
     next.ex_tipi,
+    next.cenq,
     next.cbenef,
     next.vtottrib,
     next.confianca,
@@ -6075,10 +6253,15 @@ const EXPORT_PRODUCT_HEADERS = [
   "CST COFINS",
   "Aliquota COFINS",
   "Aliquota FCP",
+  "CST IPI",
+  "Aliquota IPI",
+  "EX TIPI",
+  "cEnq",
   "CST IBS/CBS",
   "cClassTrib",
-  "IPI",
-  "EX TIPI",
+  "Aliquota IBS UF",
+  "Aliquota IBS Municipio",
+  "Aliquota CBS",
   "cBenef",
   "vTotTrib"
 ];
@@ -6121,10 +6304,15 @@ function buildExportRows() {
     "CST COFINS": item.cst_cofins || "",
     "Aliquota COFINS": item.aliquota_cofins ?? "",
     "Aliquota FCP": item.aliquota_fcp ?? "",
+    "CST IPI": item.cst_ipi || "",
+    "Aliquota IPI": item.ipi ?? "",
+    "EX TIPI": item.ex_tipi || "",
+    cEnq: item.cenq || "",
     "CST IBS/CBS": item.ibs_cbs_cst || "",
     cClassTrib: item.cclass_trib || "",
-    IPI: item.ipi ?? "",
-    "EX TIPI": item.ex_tipi || "",
+    "Aliquota IBS UF": item.aliquota_ibs_uf ?? "",
+    "Aliquota IBS Municipio": item.aliquota_ibs_municipio ?? "",
+    "Aliquota CBS": item.aliquota_cbs ?? "",
     cBenef: item.cbenef || "",
     vTotTrib: item.vtottrib ?? ""
   }));
