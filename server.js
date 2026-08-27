@@ -42,12 +42,12 @@ const OPENAI_NCM_API_URL = process.env.OPENAI_NCM_API_URL || "https://api.openai
 const OPENAI_NCM_APPLY_THRESHOLD = Math.min(Math.max(Number(process.env.OPENAI_NCM_APPLY_THRESHOLD || 0.9), 0.9), 0.99);
 const OPENAI_NCM_MAX_CANDIDATES = Math.min(Math.max(Number(process.env.OPENAI_NCM_MAX_CANDIDATES || 8), 3), 15);
 const OPENAI_NCM_TIMEOUT_MS = Math.min(Math.max(Number(process.env.OPENAI_NCM_TIMEOUT_MS || 30000), 8000), 90000);
-const OPENAI_NCM_MAX_OUTPUT_TOKENS = Math.min(Math.max(Number(process.env.OPENAI_NCM_MAX_OUTPUT_TOKENS || 4200), 600), 8000);
+const OPENAI_NCM_MAX_OUTPUT_TOKENS = Math.min(Math.max(Number(process.env.OPENAI_NCM_MAX_OUTPUT_TOKENS || 1200), 600), 3000);
 const OPENAI_NCM_WEB_SEARCH_ENABLED = String(process.env.OPENAI_NCM_WEB_SEARCH_ENABLED || "true").toLowerCase() !== "false";
-const OPENAI_NCM_CONCURRENCY_INPUT = Number(process.env.OPENAI_NCM_CONCURRENCY || 3);
+const OPENAI_NCM_CONCURRENCY_INPUT = Number(process.env.OPENAI_NCM_CONCURRENCY || 10);
 const OPENAI_NCM_CONCURRENCY = Math.min(
-  Math.max(Number.isFinite(OPENAI_NCM_CONCURRENCY_INPUT) ? Math.round(OPENAI_NCM_CONCURRENCY_INPUT) : 3, 1),
-  8
+  Math.max(Number.isFinite(OPENAI_NCM_CONCURRENCY_INPUT) ? Math.round(OPENAI_NCM_CONCURRENCY_INPUT) : 10, 1),
+  10
 );
 const AI_LEARNING_ENABLED = false;
 const MERCADO_PAGO_ACCESS_TOKEN = process.env.MERCADO_PAGO_ACCESS_TOKEN || "";
@@ -3027,32 +3027,73 @@ const AI_NCM_SCHEMA = {
   type: "object",
   additionalProperties: false,
   required: [
+    "request_id",
+    "sku",
+    "descricao_original",
+    "caracteristicas_explicitas",
     "ncm",
-    "confidence",
+    "confianca_ncm",
+    "cest_possivel",
+    "confianca_cest",
+    "especificacao_suficiente",
+    "faltando",
+    "justificativa_curta",
     "status",
-    "should_apply",
-    "needs_review",
-    "product_category",
-    "reason",
-    "warnings",
-    "sources",
-    "product_profile",
-    "field_scores",
-    "smart_questions",
-    "fiscal_layers",
-    "field_suggestions",
-    "why"
+    "fontes",
+    "avisos"
   ],
   properties: {
+    request_id: { type: "string" },
+    sku: { type: "string" },
+    descricao_original: { type: "string" },
+    caracteristicas_explicitas: {
+      type: "object",
+      additionalProperties: false,
+      required: [
+        "produto",
+        "marca",
+        "composicao",
+        "material",
+        "finalidade",
+        "embalagem",
+        "volume",
+        "unidade",
+        "dimensao",
+        "apresentacao",
+        "funcao_principal",
+        "funcionamento",
+        "uso",
+        "outras"
+      ],
+      properties: {
+        produto: { type: "string" },
+        marca: { type: "string" },
+        composicao: { type: "string" },
+        material: { type: "string" },
+        finalidade: { type: "string" },
+        embalagem: { type: "string" },
+        volume: { type: "string" },
+        unidade: { type: "string" },
+        dimensao: { type: "string" },
+        apresentacao: { type: "string" },
+        funcao_principal: { type: "string" },
+        funcionamento: { type: "string" },
+        uso: { type: "string" },
+        outras: { type: "array", items: { type: "string" } }
+      }
+    },
     ncm: { type: "string" },
-    confidence: { type: "number" },
-    status: { type: "string", enum: ["apply", "review", "uncertain", "insufficient_info", "invalid_ncm"] },
-    should_apply: { type: "boolean" },
-    needs_review: { type: "boolean" },
-    product_category: { type: "string" },
-    reason: { type: "string" },
-    warnings: { type: "array", items: { type: "string" } },
-    sources: {
+    confianca_ncm: { type: "number" },
+    cest_possivel: { type: "string" },
+    confianca_cest: { type: "number" },
+    especificacao_suficiente: { type: "boolean" },
+    faltando: { type: "array", items: { type: "string" } },
+    justificativa_curta: { type: "string" },
+    status: {
+      type: "string",
+      enum: ["CLASSIFICADO", "REVISAO_ESPECIFICACAO", "ERRO_BASE_FISCAL", "ERRO_OPENAI", "ERRO_VALIDACAO"]
+    },
+    fontes: {
       type: "array",
       items: {
         type: "object",
@@ -3067,205 +3108,7 @@ const AI_NCM_SCHEMA = {
         }
       }
     },
-    product_profile: {
-      type: "object",
-      additionalProperties: false,
-      required: [
-        "produto_base",
-        "marca",
-        "composicao",
-        "material",
-        "finalidade",
-        "embalagem",
-        "volume",
-        "unidade",
-        "funcao_principal",
-        "funcionamento",
-        "uso",
-        "caracteristicas",
-        "missing_characteristics"
-      ],
-      properties: {
-        produto_base: { type: "string" },
-        marca: { type: "string" },
-        composicao: { type: "string" },
-        material: { type: "string" },
-        finalidade: { type: "string" },
-        embalagem: { type: "string" },
-        volume: { type: "string" },
-        unidade: { type: "string" },
-        funcao_principal: { type: "string" },
-        funcionamento: { type: "string" },
-        uso: { type: "string" },
-        caracteristicas: { type: "array", items: { type: "string" } },
-        missing_characteristics: { type: "array", items: { type: "string" } }
-      }
-    },
-    field_scores: {
-      type: "object",
-      additionalProperties: false,
-      required: ["ncm", "cest", "cfop", "csosn_cst", "icms", "icms_st", "fcp", "ibs_cbs", "pis_cofins", "ipi", "cbenef"],
-      properties: {
-        ncm: { type: "number" },
-        cest: { type: "number" },
-        cfop: { type: "number" },
-        csosn_cst: { type: "number" },
-        icms: { type: "number" },
-        icms_st: { type: "number" },
-        fcp: { type: "number" },
-        ibs_cbs: { type: "number" },
-        pis_cofins: { type: "number" },
-        ipi: { type: "number" },
-        cbenef: { type: "number" }
-      }
-    },
-    smart_questions: {
-      type: "array",
-      items: {
-        type: "object",
-        additionalProperties: false,
-        required: ["field", "question", "options", "reason", "blocks_auto_apply"],
-        properties: {
-          field: { type: "string" },
-          question: { type: "string" },
-          options: { type: "array", items: { type: "string" } },
-          reason: { type: "string" },
-          blocks_auto_apply: { type: "boolean" }
-        }
-      }
-    },
-    fiscal_layers: {
-      type: "object",
-      additionalProperties: false,
-      required: ["produto", "empresa", "operacao"],
-      properties: {
-        produto: {
-          type: "object",
-          additionalProperties: false,
-          required: ["ncm", "descricao_fiscal", "cest", "cest_obrigatorio", "unidade", "ex_tipi", "caracteristicas"],
-          properties: {
-            ncm: { type: "string" },
-            descricao_fiscal: { type: "string" },
-            cest: { type: "string" },
-            cest_obrigatorio: { type: "string", enum: ["sim", "nao", "incerto"] },
-            unidade: { type: "string" },
-            ex_tipi: { type: "string" },
-            caracteristicas: { type: "array", items: { type: "string" } }
-          }
-        },
-        empresa: {
-          type: "object",
-          additionalProperties: false,
-          required: ["regime", "uf", "impacto"],
-          properties: {
-            regime: { type: "string" },
-            uf: { type: "string" },
-            impacto: { type: "string" }
-          }
-        },
-        operacao: {
-          type: "object",
-          additionalProperties: false,
-          required: ["tipo", "cfop_interno", "cfop_interestadual", "dependencias"],
-          properties: {
-            tipo: { type: "string" },
-            cfop_interno: { type: "string" },
-            cfop_interestadual: { type: "string" },
-            dependencias: { type: "array", items: { type: "string" } }
-          }
-        }
-      }
-    },
-    field_suggestions: {
-      type: "object",
-      additionalProperties: false,
-      required: [
-        "ncm",
-        "ncm_description",
-        "sku",
-        "ean",
-        "unidade",
-        "cest",
-        "cest_required",
-        "cest_confidence",
-        "cest_reason",
-        "cfop_internal",
-        "cfop_interstate",
-        "cfop_confidence",
-        "cfop_reason",
-        "csosn",
-        "cst_icms",
-        "aliquota_icms",
-        "icms_st",
-        "icms_st_reason",
-        "origem",
-        "cst_pis",
-        "aliquota_pis",
-        "pis_cofins_reason",
-        "cst_cofins",
-        "aliquota_cofins",
-        "aliquota_fcp",
-        "ibs_cbs_cst",
-        "cclass_trib",
-        "ibs_cbs_reason",
-        "ipi",
-        "ipi_reason",
-        "ex_tipi",
-        "cbenef",
-        "benefit_reason",
-        "vtottrib",
-        "observations"
-      ],
-      properties: {
-        ncm: { type: "string" },
-        ncm_description: { type: "string" },
-        sku: { type: "string" },
-        ean: { type: "string" },
-        unidade: { type: "string" },
-        cest: { type: "string" },
-        cest_required: { type: "string", enum: ["sim", "nao", "incerto"] },
-        cest_confidence: { type: "number" },
-        cest_reason: { type: "string" },
-        cfop_internal: { type: "string" },
-        cfop_interstate: { type: "string" },
-        cfop_confidence: { type: "number" },
-        cfop_reason: { type: "string" },
-        csosn: { type: "string" },
-        cst_icms: { type: "string" },
-        aliquota_icms: { type: "number" },
-        icms_st: { type: "string", enum: ["sim", "nao", "incerto"] },
-        icms_st_reason: { type: "string" },
-        origem: { type: "string" },
-        cst_pis: { type: "string" },
-        aliquota_pis: { type: "number" },
-        pis_cofins_reason: { type: "string" },
-        cst_cofins: { type: "string" },
-        aliquota_cofins: { type: "number" },
-        aliquota_fcp: { type: "number" },
-        ibs_cbs_cst: { type: "string" },
-        cclass_trib: { type: "string" },
-        ibs_cbs_reason: { type: "string" },
-        ipi: { type: "string" },
-        ipi_reason: { type: "string" },
-        ex_tipi: { type: "string" },
-        cbenef: { type: "string" },
-        benefit_reason: { type: "string" },
-        vtottrib: { type: "string" },
-        observations: { type: "array", items: { type: "string" } }
-      }
-    },
-    why: {
-      type: "object",
-      additionalProperties: false,
-      required: ["identified_as", "official_basis", "evidence_summary", "discarded_alternatives", "review_recommendation"],
-      properties: {
-        identified_as: { type: "string" },
-        official_basis: { type: "string" },
-        evidence_summary: { type: "string" },
-        discarded_alternatives: { type: "array", items: { type: "string" } },
-        review_recommendation: { type: "string" }
-      }
-    }
+    avisos: { type: "array", items: { type: "string" } }
   }
 };
 
@@ -3278,25 +3121,18 @@ function assertOpenAiConfigured() {
 
 function aiNcmInstructions() {
   return [
-    "Voce e um motor de classificacao fiscal assistida para produtos vendidos no Brasil.",
-    "Trabalhe em camadas: primeiro Produto, depois Empresa, depois Operacao. Nao misture CFOP/CSOSN/CST com NCM sem explicar a dependencia.",
-    "Use as consultas em search_queries. Pesquise o produto com NCM, CEST, EX TIPI/TIPI, unidade comercial, CST/CSOSN, CFOP, ICMS/ST/FCP, PIS/COFINS, IPI, IBS/CBS, cClassTrib, beneficios e reducoes fiscais.",
-    "Use todos os dados enviados: base oficial/local NCM, candidatos ranqueados, contexto de empresa/operacao, tax_scope.uf, tabelas fiscais locais e evidencia web quando existir. O aprendizado por regra validada esta removido e nao deve influenciar a decisao.",
-    "O codigo final de NCM deve estar em ncm_policy.allowed_ncms. Nunca retorne NCM fora dessa whitelist; se nenhum candidato da whitelist for compativel, retorne ncm '00000000', status 'insufficient_info' ou 'invalid_ncm' e should_apply false.",
-    "Nao invente codigos. Quando a web apontar claramente um NCM, ele so pode ser usado se o backend colocou esse codigo em ncm_policy.allowed_ncms. Quando a web indicar que nao ha CEST especifico obrigatorio, reflita isso em field_suggestions e why.",
-    "Se faltar composicao, material, finalidade, funcionamento ou uso e essa informacao puder mudar o NCM, NAO CLASSIFIQUE automaticamente. Retorne smart_questions bloqueantes, status 'insufficient_info' e should_apply false.",
-    "Retorne smart_questions com 2 ou 3 perguntas somente quando a resposta puder mudar NCM, CEST ou regra fiscal. Marque blocks_auto_apply true sempre que a ambiguidade impedir aplicar com 90% ou mais de confianca.",
-    "Se a confianca de NCM ficar abaixo de 0.90, deixe should_apply false e status review ou uncertain. Nao feche automaticamente abaixo de 90%.",
+    "Voce e o classificador stateless de NCM da Aikkie para produtos vendidos no Brasil.",
+    "Cada requisicao e independente. Use request_id e sku recebidos no contexto e devolva exatamente os mesmos valores; nao use memoria, conversa anterior, produto anterior ou inferencia de outro item.",
+    "Utilize exclusivamente caracteristicas explicitamente informadas na descricao do produto. Nao presuma finalidade, material, composicao, mecanismo, funcionamento, embalagem, origem, aplicacao ou uso quando isso nao estiver escrito.",
+    "Extraia somente as caracteristicas explicitas e escolha o NCM mais compativel entre ncm_policy.allowed_ncms. Nunca retorne NCM fora dessa whitelist.",
+    "Se ncm_policy.allowed_ncms estiver vazio, retorne ncm '00000000', status 'ERRO_BASE_FISCAL' e explique que a base/candidatos do backend vieram vazios.",
+    "Se existir candidato, mas a descricao nao tiver informacao suficiente para decidir entre NCMs que podem mudar pela composicao, material, finalidade, funcionamento ou uso, retorne status 'REVISAO_ESPECIFICACAO', ncm '00000000' e liste os campos em faltando.",
+    "Se o NCM escolhido tiver confianca menor que 0.90, retorne status 'REVISAO_ESPECIFICACAO' e ncm '00000000'.",
+    "Nao calcule CFOP, CST/CSOSN, ICMS, FCP, PIS, COFINS, IPI, IBS/CBS, cClassTrib, cBenef ou vTotTrib. Esses campos pertencem ao backend fiscal.",
+    "Voce pode preencher cest_possivel somente se a evidencia/candidato indicar um CEST claramente relacionado ao produto; caso contrario use string vazia.",
     "Diferencie produto base de acessorio ou uso: cabo eletrico, cabo de dados e cabo de fibra optica podem ter NCM diferente; lapis escolar nao e apontador; lapis de maquiagem e cosmetico; rolo de pintura nao e reagente; racao de gatos ou cachorros e alimento para animais.",
     "Priorize frase especifica, funcao principal, composicao, material, finalidade, funcionamento e uso sobre repeticao de palavra solta.",
-    "Para CEST e ICMS/ST: use tax_scope.uf como UF fiscal. Se existir CEST aplicavel ao NCM/produto/apresentacao/UF, retorne o codigo e icms_st 'sim'; se a evidencia indicar que nao existe CEST obrigatorio especifico para essa UF/contexto, retorne cest_required 'nao', cest 'SEM CEST OBRIGATORIO' e icms_st 'nao'.",
-    "Para SKU e EAN: preserve os identificadores enviados pelo produto; nao invente EAN. Se o codigo de barras vier vazio, retorne string vazia.",
-    "Para ICMS, FCP e cBenef: preencha somente quando houver regra/tabela/evidencia clara para produto, tax_scope.uf, regime e operacao. Se depender de UF destino, beneficio estadual, ST, consumidor final ou enquadramento nao informado, deixe vazio ou 0 e explique em observations/warnings.",
-    "Para CFOP: use o tipo de operacao e a UF de origem em operation.uf_origem, mas indique baixa confianca quando depender de destinatario, finalidade, consumidor final ou operacao nao informada.",
-    "Para IBS/CBS: nunca use CST 000 + cClassTrib 000001 como fallback generico. Pesquise a tabela vigente de cClassTrib/LC 214/2025 e beneficios/reducoes por NCM. Se houver reducao, aliquota zero ou cesta basica aplicavel, retorne o CST/cClassTrib especifico. Se nao houver certeza, deixe ibs_cbs_cst e cclass_trib vazios e explique.",
-    "Para IPI/EX TIPI: pesquise TIPI pelo NCM; retorne aliquota IPI e EX TIPI somente quando houver evidencia. Se nao houver EX, retorne string vazia.",
-    "Preencha why para o contador entender: identificado como, base oficial usada, evidencia, alternativas descartadas e recomendacao de revisao.",
-    "Explique no campo reason por que aplicou ou bloqueou, citando categoria do produto e sinais dos candidatos/fontes.",
+    "A justificativa_curta deve ser curta, objetiva e baseada nos candidatos permitidos/fontes. Nada de resposta longa.",
     "Retorne apenas JSON no formato do schema."
   ].join(" ");
 }
@@ -3417,8 +3253,14 @@ function getNcmCatalogMetadata() {
   };
 }
 
+function buildAiRequestId(classification = {}) {
+  const stablePart = classification.id || classification.product_id || "item";
+  return `req_${stablePart}_${randomUUID().slice(0, 8)}`;
+}
+
 async function buildAiNcmContext(classification, options = {}) {
   const productText = `${classification.descricao_original || ""} ${classification.marca || ""} ${classification.categoria || ""}`.trim();
+  const requestId = asCleanString(options.request_id || options.requestId, buildAiRequestId(classification));
   const fiscalUf = getFiscalUfForClassification(classification);
   const searchQueries = buildFiscalSearchQueries(productText, fiscalUf);
   const currentCode = normalizeNcmCode(classification.ncm);
@@ -3436,6 +3278,7 @@ async function buildAiNcmContext(classification, options = {}) {
   const useWeb = Boolean(options.use_web || options.useWeb);
   const web = await fetchWebEvidence(productText, localCandidate, { useWeb, uf: fiscalUf });
   return {
+    request_id: requestId,
     generated_at: now(),
     official_ncm_source: NCM_JSON_URL,
     ncm_catalog: getNcmCatalogMetadata(),
@@ -3566,12 +3409,6 @@ function collectOpenAiWebEvidence(payload) {
   return items.slice(0, NCM_WEB_EVIDENCE_LIMIT);
 }
 
-function shouldUseOpenAiWebSearch(context) {
-  if (!OPENAI_NCM_WEB_SEARCH_ENABLED) return false;
-  const status = context.web_evidence?.status;
-  return Boolean(status && status !== "not_requested" && status !== "ok");
-}
-
 function mergeOpenAiWebEvidence(context, openAiItems = []) {
   if (!openAiItems.length) return context;
   const currentWeb = context.web_evidence || {};
@@ -3587,71 +3424,30 @@ function mergeOpenAiWebEvidence(context, openAiItems = []) {
   };
 }
 
-async function callOpenAiNcmWebSearch(context) {
-  if (!shouldUseOpenAiWebSearch(context)) return [];
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), OPENAI_NCM_TIMEOUT_MS);
-  const request = {
-    model: OPENAI_NCM_MODEL,
-    instructions:
-      "Pesquise na web o pacote fiscal brasileiro do produto considerando tax_scope.uf: NCM, CEST/ICMS-ST, EX TIPI/TIPI, IPI, unidade comercial quando a descricao indicar peso ou unidade, PIS/COFINS, FCP, IBS/CBS, cClassTrib, beneficios e reducoes fiscais. Use search_queries.fiscal_full e as consultas especificas. Priorize Receita Federal, Portal NF-e, Siscomex, Confaz/Convenios ICMS, SEFAZ da UF e tabelas fiscais confiaveis com descricao especifica. Responda curto citando codigos encontrados por campo e indicando incertezas. Nao invente codigo.",
-    input: [
-      {
-        role: "user",
-        content: [
-          {
-            type: "input_text",
-            text: JSON.stringify({
-              search_query: context.search_query,
-              search_queries: context.search_queries,
-              product: context.product,
-              company: context.company,
-              tax_scope: context.tax_scope,
-              operation: context.operation,
-              current: context.current,
-              local_best: context.local_best,
-              candidates: (context.candidates || []).slice(0, 5),
-              local_fiscal_tables: context.local_fiscal_tables
-            })
-          }
-        ]
-      }
-    ],
-    max_output_tokens: 900,
-    tools: [
-      {
-        type: "web_search",
-        search_context_size: "low",
-        user_location: {
-          type: "approximate",
-          country: "BR",
-          timezone: "America/Sao_Paulo"
-        }
-      }
-    ],
-    tool_choice: "required",
-    include: ["web_search_call.results"]
+function buildOpenAiNcmInput(context = {}) {
+  return {
+    request_id: context.request_id,
+    generated_at: context.generated_at,
+    ncm_catalog: context.ncm_catalog,
+    search_queries: {
+      ncm: context.search_queries?.ncm || "",
+      ncm_cest: context.search_queries?.ncm_cest || "",
+      fiscal_full: context.search_queries?.fiscal_full || ""
+    },
+    product: context.product,
+    company: {
+      uf: context.company?.uf || "",
+      regime_tributario: context.company?.regime_tributario || "",
+      crt: context.company?.crt || "",
+      contribuinte_icms: Boolean(context.company?.contribuinte_icms)
+    },
+    tax_scope: context.tax_scope,
+    operation: context.operation,
+    local_best: context.local_best,
+    candidates: (context.candidates || []).slice(0, OPENAI_NCM_MAX_CANDIDATES),
+    ncm_policy: context.ncm_policy,
+    web_evidence: context.web_evidence
   };
-
-  try {
-    const response = await fetch(OPENAI_NCM_API_URL, {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${OPENAI_API_KEY}`,
-        "Content-Type": "application/json"
-      },
-      body: JSON.stringify(request),
-      signal: controller.signal
-    });
-    const contentType = response.headers.get("content-type") || "";
-    const payload = contentType.includes("application/json") ? await response.json() : { error: await response.text() };
-    if (!response.ok) return [];
-    return collectOpenAiWebEvidence(payload);
-  } catch {
-    return [];
-  } finally {
-    clearTimeout(timeout);
-  }
 }
 
 async function callOpenAiNcm(context) {
@@ -3667,7 +3463,7 @@ async function callOpenAiNcm(context) {
         content: [
           {
             type: "input_text",
-            text: JSON.stringify(context)
+            text: JSON.stringify(buildOpenAiNcmInput(context))
           }
         ]
       }
@@ -3682,6 +3478,22 @@ async function callOpenAiNcm(context) {
       }
     }
   };
+
+  if (OPENAI_NCM_WEB_SEARCH_ENABLED) {
+    request.tools = [
+      {
+        type: "web_search",
+        search_context_size: "low",
+        user_location: {
+          type: "approximate",
+          country: "BR",
+          timezone: "America/Sao_Paulo"
+        }
+      }
+    ];
+    request.tool_choice = "auto";
+    request.include = ["web_search_call.results"];
+  }
 
   try {
     const response = await fetch(OPENAI_NCM_API_URL, {
@@ -3709,7 +3521,8 @@ async function callOpenAiNcm(context) {
       usage: payload.usage || null,
       raw_text: outputText,
       parsed,
-      parse_error: parsed ? null : "O classificador automatico respondeu sem JSON valido para o NCM."
+      parse_error: parsed ? null : "O classificador automatico respondeu sem JSON valido para o NCM.",
+      web_evidence: collectOpenAiWebEvidence(payload)
     };
   } finally {
     clearTimeout(timeout);
@@ -3814,28 +3627,37 @@ function normalizeCestSuggestion(value, required = "") {
 function buildDefaultProductProfile(context = {}, ai = {}) {
   const product = context.product || {};
   const profile = ai.product_profile || {};
+  const explicit = ai.caracteristicas_explicitas || {};
+  const extraCharacteristics = [
+    explicit.dimensao,
+    explicit.apresentacao,
+    ...(Array.isArray(explicit.outras) ? explicit.outras : []),
+    ...(Array.isArray(profile.caracteristicas) ? profile.caracteristicas : [])
+  ];
   return {
-    produto_base: asCleanString(profile.produto_base, asCleanString(ai.product_category, product.descricao || "")),
-    marca: asCleanString(profile.marca, product.marca || ""),
-    composicao: asCleanString(profile.composicao),
-    material: asCleanString(profile.material),
-    finalidade: asCleanString(profile.finalidade),
-    embalagem: asCleanString(profile.embalagem),
-    volume: asCleanString(profile.volume),
-    unidade: asCleanString(profile.unidade, product.unidade || ""),
-    funcao_principal: asCleanString(profile.funcao_principal, asCleanString(ai.product_category, product.descricao || "")),
-    funcionamento: asCleanString(profile.funcionamento),
-    uso: asCleanString(profile.uso),
-    caracteristicas: asStringArray(profile.caracteristicas),
-    missing_characteristics: asStringArray(profile.missing_characteristics)
+    produto_base: asCleanString(explicit.produto, asCleanString(profile.produto_base, asCleanString(ai.product_category, product.descricao || ""))),
+    marca: asCleanString(explicit.marca, asCleanString(profile.marca, product.marca || "")),
+    composicao: asCleanString(explicit.composicao, profile.composicao),
+    material: asCleanString(explicit.material, profile.material),
+    finalidade: asCleanString(explicit.finalidade, profile.finalidade),
+    embalagem: asCleanString(explicit.embalagem, profile.embalagem),
+    volume: asCleanString(explicit.volume, profile.volume),
+    unidade: asCleanString(explicit.unidade, asCleanString(profile.unidade, product.unidade || "")),
+    funcao_principal: asCleanString(explicit.funcao_principal, asCleanString(profile.funcao_principal, asCleanString(ai.product_category, product.descricao || ""))),
+    funcionamento: asCleanString(explicit.funcionamento, profile.funcionamento),
+    uso: asCleanString(explicit.uso, profile.uso),
+    caracteristicas: asStringArray(extraCharacteristics),
+    missing_characteristics: asStringArray(ai.faltando || profile.missing_characteristics)
   };
 }
 
 function buildFieldScores(ai = {}, confidence = 0) {
   const scores = ai.field_scores || {};
+  const ncmConfidence = ai.confianca_ncm ?? confidence;
+  const cestConfidence = ai.confianca_cest ?? scores.cest;
   return {
-    ncm: clampScore(scores.ncm, confidence),
-    cest: clampScore(scores.cest, 0.35),
+    ncm: clampScore(scores.ncm, ncmConfidence),
+    cest: clampScore(cestConfidence, 0.35),
     cfop: clampScore(scores.cfop, 0.55),
     csosn_cst: clampScore(scores.csosn_cst, 0.5),
     icms: clampScore(scores.icms, 0.35),
@@ -3857,8 +3679,19 @@ function normalizeSmartQuestions(ai = {}, context = {}, confidence = 0) {
       reason: asCleanString(item?.reason),
       blocks_auto_apply: Boolean(item?.blocks_auto_apply)
     }))
-    .filter((item) => item.question)
-    .slice(0, 3);
+      .filter((item) => item.question)
+      .slice(0, 3);
+  const missing = asStringArray(ai.faltando, 4);
+
+  if (!questions.length && missing.length) {
+    questions.push({
+      field: "produto",
+      question: `Complete a descricao com: ${missing.join(", ")}.`,
+      options: missing,
+      reason: "Essas informacoes podem mudar o NCM ou o enquadramento fiscal.",
+      blocks_auto_apply: true
+    });
+  }
 
   if (!questions.length && confidence < OPENAI_NCM_APPLY_THRESHOLD) {
     questions.push({
@@ -4232,10 +4065,14 @@ function normalizeSources(sources = [], code = "", context = {}) {
 function buildFieldSuggestions(ai = {}, context = {}, code = "", description = "", confidence = 0) {
   const suggestion = ai.field_suggestions || {};
   const trustedCode = normalizeNcmCode(code);
-  const tables = trustedCode && trustedCode !== "00000000" ? getFiscalTablesForNcm(trustedCode) : getFiscalTablesForNcm("");
+  const hasTrustedNcm = Boolean(trustedCode && trustedCode !== "00000000");
+  const tables =
+    hasTrustedNcm
+      ? getFiscalTablesForNcm(trustedCode)
+      : { cest: [], tipi: [], pis_cofins: [], cbenef: [], ibs_cbs_cst: [], ibs_cbs_classificacao: [] };
   const localCest = tables.cest?.[0]?.codigo_cest || "";
-  const webCest = getCestsFromWebEvidence(context.web_evidence)[0]?.codigo || "";
-  const webNoCest = webEvidenceSaysNoCest(context.web_evidence);
+  const webCest = hasTrustedNcm ? getCestsFromWebEvidence(context.web_evidence)[0]?.codigo || "" : "";
+  const webNoCest = hasTrustedNcm ? webEvidenceSaysNoCest(context.web_evidence) : false;
   const rawCestRequired = normalizeSimNaoIncerto(suggestion.cest_required, webNoCest ? "nao" : webCest || localCest ? "sim" : "incerto");
   const cestRequired = isNoCestSignal(suggestion.cest, rawCestRequired) ? "nao" : rawCestRequired;
   const cest = normalizeCestSuggestion(suggestion.cest || webCest || localCest, cestRequired);
@@ -4353,9 +4190,15 @@ function buildWhy(ai = {}, context = {}, code = "", description = "", questions 
     }
   }
   return {
-    identified_as: asCleanString(why.identified_as, asCleanString(ai.product_category, context.product?.descricao || "")),
+    identified_as: asCleanString(
+      why.identified_as,
+      asCleanString(ai.caracteristicas_explicitas?.produto, asCleanString(ai.product_category, context.product?.descricao || ""))
+    ),
     official_basis: asCleanString(why.official_basis, description ? `NCM oficial: ${description}` : "Base oficial/local NCM e evidencia web consultadas."),
-    evidence_summary: asCleanString(why.evidence_summary, asCleanString(ai.reason, "Classificacao feita por candidatos oficiais, tabelas locais e pesquisa web.")),
+    evidence_summary: asCleanString(
+      why.evidence_summary,
+      asCleanString(ai.justificativa_curta, asCleanString(ai.reason, "Classificacao feita por candidatos oficiais, tabelas locais e pesquisa web."))
+    ),
     discarded_alternatives: alternatives.slice(0, 6),
     review_recommendation: asCleanString(
       why.review_recommendation,
@@ -4462,18 +4305,11 @@ function buildNcmDecisionPolicy(context = {}) {
     }
   }
 
-  const currentCode = normalizeNcmCode(context.current?.ncm);
-  if (context.current?.exists_in_official) addAllowedNcm(allowed, currentCode, "current");
-
-  for (const webCode of getOfficialNcmsFromWebEvidence(context.web_evidence)) {
-    addAllowedNcm(allowed, webCode.codigo, "web_evidence", webCode.count);
-  }
-
   return {
     source: NCM_JSON_URL,
     table_version: context.ncm_catalog?.latest_start_date || "",
     apply_threshold: OPENAI_NCM_APPLY_THRESHOLD,
-    rule: "O NCM final deve existir na tabela oficial vigente e estar em allowed_ncms. Se faltar informacao do produto, retorne status insufficient_info e should_apply false.",
+    rule: "O NCM final deve existir na tabela oficial vigente e estar em allowed_ncms. allowed_ncms vazio significa ERRO_BASE_FISCAL, nao falta de especificacao do cliente.",
     allowed_ncms: [...allowed.values()].slice(0, 18)
   };
 }
@@ -4503,8 +4339,42 @@ function aiSourceDescription(sources = [], code) {
   return source?.description ? String(source.description) : null;
 }
 
+function normalizeAiClassificationStatus(status) {
+  const text = normalizeText(status).replace(/\s+/g, "_");
+  if (["classificado", "apply", "aplicado"].includes(text)) return "CLASSIFICADO";
+  if (["revisao_especificacao", "insufficient_info", "review", "uncertain", "falta_dados"].includes(text)) {
+    return "REVISAO_ESPECIFICACAO";
+  }
+  if (["erro_base_fiscal", "base_error", "base_fiscal"].includes(text)) return "ERRO_BASE_FISCAL";
+  if (["erro_openai", "openai_error"].includes(text)) return "ERRO_OPENAI";
+  if (["erro_validacao", "invalid_ncm", "validation_error"].includes(text)) return "ERRO_VALIDACAO";
+  return "REVISAO_ESPECIFICACAO";
+}
+
+function validateAiResponseIdentity(ai = {}, context = {}) {
+  const expectedRequestId = asCleanString(context.request_id);
+  const returnedRequestId = asCleanString(ai.request_id);
+  const expectedSku = asCleanString(context.product?.sku || context.product?.codigo_produto || "");
+  const returnedSku = asCleanString(ai.sku);
+  const errors = [];
+
+  if (expectedRequestId && returnedRequestId !== expectedRequestId) {
+    errors.push(`request_id divergente: esperado ${expectedRequestId}, recebido ${returnedRequestId || "vazio"}.`);
+  }
+
+  if (expectedSku && returnedSku && normalizeText(expectedSku) !== normalizeText(returnedSku)) {
+    errors.push(`sku divergente: esperado ${expectedSku}, recebido ${returnedSku}.`);
+  }
+
+  return { ok: errors.length === 0, errors };
+}
+
+function hasAllowedNcmCandidates(context = {}) {
+  return Boolean((context.ncm_policy?.allowed_ncms || []).length);
+}
+
 function buildAiWarnings(ai, context, code) {
-  const warnings = Array.isArray(ai?.warnings) ? ai.warnings.map((item) => String(item)).filter(Boolean) : [];
+  const warnings = asStringArray(ai?.avisos || ai?.warnings, 8);
   const genericCandidate = [context.local_best, ...(context.candidates || [])].find(
     (candidate) => normalizeNcmCode(candidate?.codigo) === code && candidate?.needs_specification
   );
@@ -4517,201 +4387,312 @@ function buildAiWarnings(ai, context, code) {
   return warnings.slice(0, 6);
 }
 
-function officialCodeFromCandidate(candidate) {
-  const code = normalizeNcmCode(candidate?.codigo);
-  return code && code !== "00000000" && getOfficialNcmRow(code) ? code : null;
-}
-
-function pickFallbackNcmCode(context, rawText = "") {
-  for (const code of extractNcmCodesFromText(rawText)) {
-    if (findAllowedNcmPolicyEntry(context, code)) return { code, source: "openai_text" };
-  }
-
-  const webCode = pickWebEvidenceNcm(context.web_evidence, null) || getNcmsFromWebEvidence(context.web_evidence)[0];
-  if (webCode?.codigo && findAllowedNcmPolicyEntry(context, webCode.codigo)) return { code: webCode.codigo, source: "web_evidence" };
-
-  const localBest = officialCodeFromCandidate(context.local_best);
-  if (localBest && findAllowedNcmPolicyEntry(context, localBest)) return { code: localBest, source: "local_best" };
-
-  const candidate = (context.candidates || []).find((item) => officialCodeFromCandidate(item));
-  const candidateCode = officialCodeFromCandidate(candidate);
-  if (candidateCode && findAllowedNcmPolicyEntry(context, candidateCode)) return { code: candidateCode, source: "candidate" };
-
-  return { code: "00000000", source: "none" };
-}
-
-function buildFallbackAiNcmResult(context, rawText = "", parseError = null) {
-  const picked = pickFallbackNcmCode(context, rawText);
-  const code = picked.code;
-  const row = getOfficialNcmRow(code);
-  const hasNcm = code && code !== "00000000";
-  const confidence = hasNcm ? 0.65 : 0.2;
-  const base = {
-    ncm: hasNcm ? code : "00000000",
-    confidence,
-    status: hasNcm ? "review" : "uncertain",
-    should_apply: false,
-    needs_review: true,
-    product_category: context.product?.descricao || "",
-    reason: hasNcm
-      ? `Classificador automatico nao retornou JSON valido; NCM sugerido por fallback usando ${picked.source}, sem aplicacao automatica.`
-      : `Classificador automatico nao retornou JSON valido e nenhum NCM oficial seguro foi encontrado. ${parseError || ""}`.trim(),
-    warnings: [
-      parseError || "Classificador automatico respondeu fora do JSON esperado.",
-      hasNcm ? "Fallback tecnico nao aplica automaticamente; contador deve conferir a classificacao." : "Revisar manualmente."
-    ],
-    sources: hasNcm
-      ? [
-          {
-            type: picked.source,
-            code,
-            description: row?.descricao || "NCM encontrado em evidencia externa",
-            url: picked.source === "web_evidence" ? "" : context.official_ncm_source || NCM_JSON_URL,
-            confidence: 0.75
-          }
-        ]
-      : []
-  };
-  const productProfile = buildDefaultProductProfile(context, base);
-  const fieldSuggestions = buildFieldSuggestions(base, context, base.ncm, row?.descricao || "", confidence);
-  const smartQuestions = mergeSmartQuestions(
-    normalizeSmartQuestions(base, context, confidence),
-    buildBackendBlockingQuestions(context, productProfile, confidence)
-  );
+function buildStructuredFiscalOutput(context = {}, result = {}) {
+  const profile = result.product_profile || {};
+  const suggestions = result.field_suggestions || {};
+  const fieldScores = result.field_scores || {};
+  const status = result.status || "REVISAO_ESPECIFICACAO";
+  const fiscalUf = context.tax_scope?.uf || context.company?.uf || "";
+  const operation = String(context.operation?.type || "").toUpperCase();
   return {
-    ...base,
-    product_profile: productProfile,
-    field_scores: buildFieldScores(base, confidence),
-    smart_questions: smartQuestions,
-    specification_menu: buildSpecificationMenu(context, productProfile, smartQuestions),
-    fiscal_layers: buildFiscalLayers(base, context, fieldSuggestions, productProfile),
-    field_suggestions: fieldSuggestions,
-    why: buildWhy(base, context, base.ncm, row?.descricao || "", smartQuestions)
+    request_id: context.request_id || "",
+    sku: context.product?.sku || context.product?.codigo_produto || "",
+    descricao_original: context.product?.descricao || "",
+    caracteristicas_explicitas: {
+      produto: profile.produto_base || "",
+      marca: profile.marca || "",
+      composicao: profile.composicao || "",
+      material: profile.material || "",
+      finalidade: profile.finalidade || "",
+      embalagem: profile.embalagem || "",
+      volume: profile.volume || "",
+      unidade: profile.unidade || "",
+      funcao_principal: profile.funcao_principal || "",
+      funcionamento: profile.funcionamento || "",
+      uso: profile.uso || "",
+      outras: profile.caracteristicas || []
+    },
+    produto_fiscal: {
+      ncm: result.ncm || "00000000",
+      confianca_ncm: result.confidence || 0,
+      cest: suggestions.cest || null,
+      confianca_cest: fieldScores.cest || 0,
+      ipi: {
+        cst: null,
+        aliquota: suggestions.ipi || null,
+        ex_tipi: suggestions.ex_tipi || null
+      },
+      unidade: suggestions.unidade || profile.unidade || context.product?.unidade || ""
+    },
+    operacao_fiscal: {
+      operacao: operation,
+      uf_origem: fiscalUf,
+      uf_destino: fiscalUf,
+      cfop: suggestions.cfop_internal || "",
+      cfop_interestadual: suggestions.cfop_interstate || "",
+      icms: {
+        csosn: suggestions.csosn || null,
+        cst: suggestions.cst_icms || null,
+        aliquota: suggestions.aliquota_icms ?? null,
+        fcp: suggestions.aliquota_fcp ?? null,
+        st: suggestions.icms_st || "incerto"
+      },
+      pis: {
+        cst: suggestions.cst_pis || null,
+        aliquota: suggestions.aliquota_pis ?? null
+      },
+      cofins: {
+        cst: suggestions.cst_cofins || null,
+        aliquota: suggestions.aliquota_cofins ?? null
+      },
+      ibs_cbs: {
+        cst: suggestions.ibs_cbs_cst || null,
+        cclass_trib: suggestions.cclass_trib || null
+      },
+      cbenef: suggestions.cbenef || null,
+      vtottrib: suggestions.vtottrib || null
+    },
+    validacao: {
+      especificacao_suficiente: !result.validation?.insufficient_info,
+      faltando: result.product_profile?.missing_characteristics || [],
+      requer_revisao: !result.eligible_to_apply,
+      status
+    },
+    justificativa_curta: result.reason || ""
+  };
+}
+
+function buildTechnicalAiPayload(context = {}, status = "ERRO_VALIDACAO", reason = "", details = {}) {
+  return {
+    request_id: context.request_id || "",
+    sku: context.product?.sku || context.product?.codigo_produto || "",
+    descricao_original: context.product?.descricao || "",
+    caracteristicas_explicitas: {
+      produto: context.product?.descricao || "",
+      marca: context.product?.marca || "",
+      composicao: "",
+      material: "",
+      finalidade: "",
+      embalagem: "",
+      volume: "",
+      unidade: context.product?.unidade || "",
+      dimensao: "",
+      apresentacao: "",
+      funcao_principal: "",
+      funcionamento: "",
+      uso: "",
+      outras: []
+    },
+    ncm: "00000000",
+    confianca_ncm: 0.01,
+    cest_possivel: "",
+    confianca_cest: 0,
+    especificacao_suficiente: false,
+    faltando: details.faltando || [],
+    justificativa_curta: reason,
+    status,
+    fontes: [],
+    avisos: asStringArray(details.avisos || details.warnings, 6)
   };
 }
 
 function normalizeAiNcmResult(ai, context) {
+  const aiStatus = normalizeAiClassificationStatus(ai?.status);
+  const identity = validateAiResponseIdentity(ai, context);
+  const hasCandidates = hasAllowedNcmCandidates(context);
   const aiNcm = normalizeNcmCode(ai?.ncm);
   const aiReturnedNcm = aiNcm && aiNcm !== "00000000" ? aiNcm : "";
   const aiOfficial = aiReturnedNcm ? getOfficialNcmRow(aiReturnedNcm) : null;
   const aiPolicyEntry = aiReturnedNcm ? findAllowedNcmPolicyEntry(context, aiReturnedNcm) : null;
-  const webEvidenceNcm = aiPolicyEntry
-    ? pickWebEvidenceNcm(context.web_evidence, aiReturnedNcm)
-    : pickWebEvidenceNcm(context.web_evidence, null);
-  const webPolicyEntry = webEvidenceNcm?.codigo ? findAllowedNcmPolicyEntry(context, webEvidenceNcm.codigo) : null;
-  const cleanNcm = aiPolicyEntry ? aiReturnedNcm : !aiReturnedNcm && webPolicyEntry ? webEvidenceNcm.codigo : aiReturnedNcm;
-  const official = getOfficialNcmRow(cleanNcm);
+  const cleanNcm = aiPolicyEntry ? aiReturnedNcm : "";
+  const official = cleanNcm ? getOfficialNcmRow(cleanNcm) : null;
   const policyEntry = cleanNcm ? findAllowedNcmPolicyEntry(context, cleanNcm) : null;
   const sourceList = policyEntry?.sources || [];
   const validNcm = Boolean(cleanNcm && cleanNcm.length === 8 && cleanNcm !== "00000000" && official);
   const whitelistAllowed = Boolean(policyEntry);
-  const fromCandidates = sourceList.some((source) => ["candidate", "local_best", "current", "validated_rule"].includes(source));
-  const fromWebEvidence = sourceList.includes("web_evidence") || webEvidenceSupportsNcm(context.web_evidence, cleanNcm);
-  const fromAiSources = aiSourcesSupportNcm(ai?.sources || [], cleanNcm);
-  const researchedNcm = Boolean(validNcm && whitelistAllowed);
-  const hasBackendCandidates = (context.ncm_policy?.allowed_ncms || []).some((item) =>
-    (item.sources || []).some((source) => ["candidate", "local_best", "current", "validated_rule"].includes(source))
-  );
-  const webOnlyNcm = Boolean(sourceList.includes("web_evidence") && !fromCandidates);
-  const autoApplySourceAllowed = Boolean(fromCandidates || (webOnlyNcm && !hasBackendCandidates && Number(policyEntry?.evidence_count || 0) >= 2));
+  const fromCandidates = sourceList.some((source) => ["candidate", "local_best"].includes(source));
+  const fromAiSources = aiSourcesSupportNcm(ai?.fontes || ai?.sources || [], cleanNcm);
   const invalidReturnedNcm = Boolean(aiReturnedNcm && (!aiOfficial || !aiPolicyEntry));
-  const confidence = clampConfidence(ai?.confidence);
-  const sourceDescription = aiSourceDescription(ai?.sources || [], cleanNcm);
+  const confidence = clampConfidence(ai?.confianca_ncm ?? ai?.confidence);
   const productProfile = buildDefaultProductProfile(context, ai);
   let smartQuestions = mergeSmartQuestions(
     normalizeSmartQuestions(ai, context, confidence),
     buildBackendBlockingQuestions(context, productProfile, confidence)
   );
   const blocksAutoApply = smartQuestions.some((item) => item.blocks_auto_apply);
+  const explicitlyInsufficient = ai?.especificacao_suficiente === false || aiStatus === "REVISAO_ESPECIFICACAO";
   const insufficientInfo = Boolean(
-    blocksAutoApply ||
-      normalizeText(ai?.status).includes("insufficient") ||
-      (productProfile.missing_characteristics.length >= 3 && confidence < 0.93)
+    explicitlyInsufficient ||
+      blocksAutoApply ||
+      (productProfile.missing_characteristics.length >= 3 && confidence < 0.93) ||
+      confidence < OPENAI_NCM_APPLY_THRESHOLD
   );
-  const outputNcm = researchedNcm ? cleanNcm : "00000000";
-  const description = official?.descricao || sourceDescription || webEvidenceNcm?.row?.descricao || "NCM nao validado na whitelist oficial";
+  const acceptedNcm = Boolean(identity.ok && hasCandidates && validNcm && whitelistAllowed && !invalidReturnedNcm);
+  const outputNcm = acceptedNcm ? cleanNcm : "00000000";
+  const description = acceptedNcm ? official?.descricao || aiSourceDescription(ai?.fontes || ai?.sources || [], cleanNcm) || "" : "";
   const warnings = buildAiWarnings(ai, context, cleanNcm);
-  if (invalidReturnedNcm) {
+  let status = aiStatus;
+
+  if (!identity.ok) {
+    status = "ERRO_VALIDACAO";
+    warnings.unshift(...identity.errors);
+  } else if (!hasCandidates) {
+    status = "ERRO_BASE_FISCAL";
+    warnings.unshift("A busca local/oficial de NCM nao retornou candidatos para este produto.");
+  } else if (invalidReturnedNcm) {
+    status = "ERRO_VALIDACAO";
     const message = aiOfficial
-      ? `NCM ${aiReturnedNcm} existe na tabela oficial, mas nao estava entre os candidatos permitidos para este produto.`
-      : `NCM ${aiReturnedNcm} nao existe na tabela oficial vigente e foi bloqueado.`;
+      ? `NCM ${aiReturnedNcm} existe na tabela oficial, mas nao estava em allowed_ncms para este produto.`
+      : `NCM ${aiReturnedNcm} nao existe na tabela oficial vigente.`;
+    warnings.unshift(message);
+  } else if (status === "CLASSIFICADO" && insufficientInfo) {
+    status = "REVISAO_ESPECIFICACAO";
+  }
+
+  if (acceptedNcm && insufficientInfo) {
+    const message = "NCM encontrado, mas nao aplicado automaticamente porque a especificacao/confianca nao atingiu a politica minima.";
     if (!warnings.some((warning) => normalizeText(warning) === normalizeText(message))) warnings.unshift(message);
   }
-  if (!researchedNcm && cleanNcm) {
-    const message = `NCM ${cleanNcm} nao passou pela whitelist oficial/candidatos da pesquisa.`;
+
+  if (!acceptedNcm && aiReturnedNcm && !invalidReturnedNcm) {
+    const message = `NCM ${aiReturnedNcm} nao foi aplicado por falha de validacao do contexto.`;
     if (!warnings.some((warning) => normalizeText(warning) === normalizeText(message))) warnings.unshift(message);
   }
-  if (researchedNcm && !autoApplySourceAllowed) {
-    const message = `NCM ${cleanNcm} veio apenas como evidencia externa e precisa de revisao contra os candidatos oficiais.`;
-    if (!warnings.some((warning) => normalizeText(warning) === normalizeText(message))) warnings.unshift(message);
-  }
-  if (insufficientInfo) {
-    const message = "Informacoes insuficientes para aplicar automaticamente com seguranca.";
-    if (!warnings.some((warning) => normalizeText(warning) === normalizeText(message))) warnings.unshift(message);
-  }
-  const fieldSuggestions = buildFieldSuggestions(ai, context, outputNcm || "00000000", researchedNcm ? description : "", confidence);
+
+  const fieldSuggestions = buildFieldSuggestions(ai, context, outputNcm || "00000000", description, confidence);
   const fieldScores = buildFieldScores(ai, confidence);
-  const safeToApply = Boolean(researchedNcm && autoApplySourceAllowed && confidence >= OPENAI_NCM_APPLY_THRESHOLD && !insufficientInfo);
-  const normalizedAiStatus = ["apply", "review", "uncertain", "insufficient_info", "invalid_ncm"].includes(ai?.status)
-    ? ai.status
-    : "uncertain";
-  const status = safeToApply
-    ? "apply"
-    : invalidReturnedNcm || (cleanNcm && !researchedNcm)
-      ? "invalid_ncm"
-      : insufficientInfo
-        ? "insufficient_info"
-        : researchedNcm
-          ? "review"
-          : normalizedAiStatus;
-  return {
+  const safeToApply = Boolean(status === "CLASSIFICADO" && acceptedNcm && confidence >= OPENAI_NCM_APPLY_THRESHOLD && !insufficientInfo);
+  const result = {
+    request_id: context.request_id || "",
+    sku: context.product?.sku || context.product?.codigo_produto || "",
     ncm: outputNcm,
     formatted: formatNcm(outputNcm),
-    descricao: researchedNcm ? description : "NCM nao aplicado",
+    descricao: acceptedNcm ? description : "NCM nao aplicado",
     confidence,
     status,
     should_apply: safeToApply,
     needs_review: !safeToApply,
-    product_category: String(ai?.product_category || ""),
-    reason: String(ai?.reason || ""),
-    warnings: warnings.slice(0, 6),
-    sources: normalizeSources(ai?.sources || [], outputNcm, context),
+    product_category: String(ai?.caracteristicas_explicitas?.produto || ai?.product_category || ""),
+    reason: String(ai?.justificativa_curta || ai?.reason || ""),
+    warnings: warnings.slice(0, 8),
+    sources: normalizeSources(ai?.fontes || ai?.sources || [], outputNcm, context),
     product_profile: productProfile,
     field_scores: fieldScores,
     smart_questions: smartQuestions,
     specification_menu: buildSpecificationMenu(context, productProfile, smartQuestions),
     fiscal_layers: buildFiscalLayers(ai, context, fieldSuggestions, productProfile),
     field_suggestions: fieldSuggestions,
-    why: buildWhy(ai, context, outputNcm, researchedNcm ? description : "", smartQuestions),
+    why: buildWhy(ai, context, outputNcm, acceptedNcm ? description : "", smartQuestions),
     eligible_to_apply: safeToApply,
     validation: {
+      status,
+      request_id_expected: context.request_id || null,
+      request_id_returned: ai?.request_id || null,
+      request_id_ok: identity.ok,
       exists_in_official: Boolean(official),
       whitelist_allowed: whitelistAllowed,
       from_candidates: fromCandidates,
-      from_web_evidence: fromWebEvidence,
+      from_web_evidence: Boolean(webEvidenceSupportsNcm(context.web_evidence, outputNcm)),
       from_ai_sources: fromAiSources,
-      web_evidence_ncm: webEvidenceNcm?.codigo || null,
-      web_evidence_ncm_count: policyEntry?.evidence_count || webEvidenceNcm?.count || 0,
       threshold: OPENAI_NCM_APPLY_THRESHOLD,
       blocks_auto_apply: blocksAutoApply,
       insufficient_info: insufficientInfo,
-      researched_ncm: researchedNcm,
-      auto_apply_source_allowed: autoApplySourceAllowed,
+      researched_ncm: acceptedNcm,
+      auto_apply_source_allowed: fromCandidates,
       returned_ncm: aiReturnedNcm || null,
       selected_ncm: outputNcm !== "00000000" ? outputNcm : null,
-      rejected_ncm: outputNcm === "00000000" && cleanNcm ? cleanNcm : null,
+      rejected_ncm: outputNcm === "00000000" && aiReturnedNcm ? aiReturnedNcm : null,
       allowed_ncms: (context.ncm_policy?.allowed_ncms || []).map((item) => item.codigo)
     }
+  };
+  result.final_json = buildStructuredFiscalOutput(context, result);
+  return result;
+}
+
+async function prepareAiNcmContext(classification, options = {}) {
+  return attachNcmDecisionPolicy(await buildAiNcmContext(classification, { ...options, use_web: false, useWeb: false }));
+}
+
+function buildBaseFiscalErrorAiCheck(enrichedContext, options = {}) {
+  const result = normalizeAiNcmResult(
+    buildTechnicalAiPayload(
+      enrichedContext,
+      "ERRO_BASE_FISCAL",
+      "A busca local/oficial de NCM nao retornou candidatos. Reforce a base NCM antes de consultar a OpenAI.",
+      { faltando: ["candidatos_ncm_backend"], avisos: ["allowed_ncms veio vazio."] }
+    ),
+    enrichedContext
+  );
+  return {
+    checked_at: now(),
+    provider: "backend",
+    model: null,
+    response_id: null,
+    usage: null,
+    parse_error: null,
+    context: enrichedContext,
+    result,
+    billing: options.billing || null,
+    message: "Auto classificacao bloqueada: a base fiscal nao retornou candidatos NCM para este produto.",
+    policy: "allowed_ncms vazio vira ERRO_BASE_FISCAL, nao consome chamada OpenAI e nao entra na cobranca da consulta."
   };
 }
 
 async function buildAiNcmSuggestion(classification, options = {}) {
-  const context = await buildAiNcmContext(classification, options);
-  const openAiWebEvidence = await callOpenAiNcmWebSearch(context);
-  const enrichedContext = attachNcmDecisionPolicy(mergeOpenAiWebEvidence(context, openAiWebEvidence));
-  const response = await callOpenAiNcm(enrichedContext);
-  const parsed = response.parsed || buildFallbackAiNcmResult(enrichedContext, response.raw_text, response.parse_error);
-  const result = normalizeAiNcmResult(parsed, enrichedContext);
+  const enrichedContext = options.context?.ncm_policy
+    ? options.context
+    : attachNcmDecisionPolicy(await buildAiNcmContext(classification, options));
+  if (!hasAllowedNcmCandidates(enrichedContext)) {
+    return buildBaseFiscalErrorAiCheck(enrichedContext, options);
+  }
+
+  let response;
+  try {
+    response = await callOpenAiNcm(enrichedContext);
+  } catch (error) {
+    const result = normalizeAiNcmResult(
+      buildTechnicalAiPayload(enrichedContext, "ERRO_OPENAI", error.message, { avisos: ["Falha na chamada do classificador automatico."] }),
+      enrichedContext
+    );
+    return {
+      checked_at: now(),
+      provider: "openai",
+      model: OPENAI_NCM_MODEL,
+      response_id: null,
+      usage: null,
+      parse_error: error.message,
+      context: enrichedContext,
+      result,
+      billing: options.billing || null,
+      message: `Auto classificacao falhou na OpenAI: ${error.message}`,
+      policy: "Falha de OpenAI vira ERRO_OPENAI por item, sem aplicar NCM por fallback."
+    };
+  }
+
+  const responseContext = mergeOpenAiWebEvidence(enrichedContext, response.web_evidence || []);
+  if (!response.parsed) {
+    const result = normalizeAiNcmResult(
+      buildTechnicalAiPayload(responseContext, "ERRO_OPENAI", response.parse_error, {
+        avisos: ["A resposta da OpenAI nao seguiu o JSON estruturado."]
+      }),
+      responseContext
+    );
+    return {
+      checked_at: now(),
+      provider: "openai",
+      model: response.model,
+      response_id: response.response_id,
+      usage: response.usage,
+      parse_error: response.parse_error,
+      context: responseContext,
+      result,
+      billing: options.billing || null,
+      message: response.parse_error,
+      policy: "JSON invalido vira ERRO_OPENAI e nao aplica NCM por fallback."
+    };
+  }
+
+  const result = normalizeAiNcmResult(response.parsed, responseContext);
   return {
     checked_at: now(),
     provider: "openai",
@@ -4719,13 +4700,13 @@ async function buildAiNcmSuggestion(classification, options = {}) {
     response_id: response.response_id,
     usage: response.usage,
     parse_error: response.parse_error,
-    context: enrichedContext,
+    context: responseContext,
     result,
     billing: options.billing || null,
     message: result.eligible_to_apply
       ? `Classificador automatico aplicou ${result.ncm} com ${Math.round(result.confidence * 100)}% de confianca.`
-      : `Classificador automatico deixou para revisao: ${result.reason || "sem confianca suficiente."}`,
-    policy: "O backend aplica automaticamente quando o NCM existe na tabela oficial/local e foi sustentado por candidato ou evidencia web permitida, sem aprendizado automatico por padrao."
+      : `Classificador automatico deixou para revisao: ${result.reason || result.status || "sem confianca suficiente."}`,
+    policy: "Uma chamada OpenAI stateless por produto. O backend valida request_id, whitelist NCM e monta os campos fiscais determinísticos."
   };
 }
 
@@ -4917,13 +4898,17 @@ async function checkClassificationAiNcm(id, options = {}, actor = "contador") {
   assertOpenAiConfigured();
   const previous = getClassification(id);
   if (!previous) return null;
+  const context = options.context?.ncm_policy ? options.context : await prepareAiNcmContext(previous, options);
+  if (!hasAllowedNcmCandidates(context)) {
+    return updateClassificationAiNcm(id, buildBaseFiscalErrorAiCheck(context, options), options, actor);
+  }
   const billing = options.skip_billing
     ? options.billing || null
     : await resolveAiBillingForUse({ classificationId: id, quantity: 1, actor, context: "item", options });
   if (billing?.enabled && billing.requires_payment) {
     return updateClassificationAiBilling(id, billing, actor);
   }
-  const check = await buildAiNcmSuggestion(previous, { ...options, billing });
+  const check = await buildAiNcmSuggestion(previous, { ...options, billing, context });
   return updateClassificationAiNcm(id, check, options, actor);
 }
 
@@ -4949,23 +4934,50 @@ async function checkReviewTableAiNcm(options = {}, actor = "contador") {
   assertOpenAiConfigured();
   const limit = Math.min(Math.max(Number(options.limit || 100), 1), 500);
   const rows = db.prepare("SELECT id FROM classifications WHERE status != 'approved' ORDER BY id LIMIT ?").all(limit);
-  const billing = rows.length
-    ? await resolveAiBillingForUse({ quantity: rows.length, actor, context: "table", options })
-    : { enabled: billingEnabled(), status: "empty", paid: true, requires_payment: false, quantity: 0, amount_cents: 0, amount_brl: 0 };
+  const aiJobs = [];
+  const preflightResults = [];
+
+  for (const row of rows) {
+    const previous = getClassification(row.id);
+    if (!previous) continue;
+    const context = await prepareAiNcmContext(previous, options);
+    if (!hasAllowedNcmCandidates(context)) {
+      const updated = updateClassificationAiNcm(row.id, buildBaseFiscalErrorAiCheck(context, options), options, actor);
+      if (updated) preflightResults.push({ updated, preflight: true });
+      continue;
+    }
+    aiJobs.push({ id: row.id, context });
+  }
+
+  const billing = aiJobs.length
+    ? await resolveAiBillingForUse({ quantity: aiJobs.length, actor, context: "table", options })
+    : {
+        enabled: billingEnabled(),
+        status: rows.length ? "no_billable_items" : "empty",
+        paid: true,
+        requires_payment: false,
+        quantity: 0,
+        amount_cents: 0,
+        amount_brl: 0
+      };
   if (billing?.enabled && billing.requires_payment) {
-    logAudit("review_table", null, "openai_ncm_billing", actor, { total: rows.length }, { billing });
+    logAudit("review_table", null, "openai_ncm_billing", actor, { total: rows.length, billable: aiJobs.length }, { billing });
     return {
-      checked: 0,
+      checked: preflightResults.length,
       applied: 0,
-      counts: {},
+      counts: preflightResults.reduce((acc, result) => {
+        const status = result.updated?.sugestao?.ai_ncm?.result?.status || "unknown";
+        acc[status] = (acc[status] || 0) + 1;
+        return acc;
+      }, {}),
       payment_required: true,
       openai: aiNcmConfig(),
       billing,
       items: listClassifications({ limit: 500 })
     };
   }
-  const paidQuantity = billing?.enabled ? Math.max(0, Number(billing.quantity || 0)) : rows.length;
-  const billableRows = billing?.enabled ? rows.slice(0, paidQuantity) : rows;
+  const paidQuantity = billing?.enabled ? Math.max(0, Number(billing.quantity || 0)) : aiJobs.length;
+  const billableRows = billing?.enabled ? aiJobs.slice(0, paidQuantity) : aiJobs;
   const concurrency = billableRows.length
     ? Math.min(normalizeAiNcmConcurrency(options.concurrency ?? OPENAI_NCM_CONCURRENCY), billableRows.length)
     : 0;
@@ -5006,7 +5018,7 @@ async function checkReviewTableAiNcm(options = {}, actor = "contador") {
     publishProgress({ current_item: currentItem });
 
     try {
-      const updated = await checkClassificationAiNcm(row.id, { ...options, skip_billing: true, billing }, actor);
+      const updated = await checkClassificationAiNcm(row.id, { ...options, skip_billing: true, billing, context: row.context }, actor);
       return updated ? { updated } : null;
     } catch (error) {
       failed += 1;
@@ -5030,7 +5042,7 @@ async function checkReviewTableAiNcm(options = {}, actor = "contador") {
   const items = [];
   const counts = {};
   let applied = 0;
-  for (const result of results) {
+  for (const result of [...preflightResults, ...results]) {
     if (result?.error) {
       counts.error = (counts.error || 0) + 1;
       continue;
@@ -5049,8 +5061,15 @@ async function checkReviewTableAiNcm(options = {}, actor = "contador") {
     error.status = 502;
     throw error;
   }
-  const unpaidItems = Math.max(0, rows.length - billableRows.length);
-  logAudit("review_table", null, "openai_ncm_check_all", actor, { total: rows.length }, { total: items.length, applied, counts, unpaidItems });
+  const unpaidItems = Math.max(0, aiJobs.length - billableRows.length);
+  logAudit("review_table", null, "openai_ncm_check_all", actor, { total: rows.length }, {
+    total: items.length,
+    applied,
+    counts,
+    unpaidItems,
+    baseErrorItems: preflightResults.length,
+    billableItems: aiJobs.length
+  });
   return {
     checked: items.length,
     applied,
@@ -5059,6 +5078,7 @@ async function checkReviewTableAiNcm(options = {}, actor = "contador") {
     concurrency: concurrency || 1,
     paid_items: billableRows.length,
     unpaid_items: unpaidItems,
+    base_error_items: preflightResults.length,
     openai: aiNcmConfig(),
     billing: billing?.event_id ? publicBillingFromEvent(getAiBillingEvent(billing.event_id)) : billing,
     items
