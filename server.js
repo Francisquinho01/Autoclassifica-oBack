@@ -49,7 +49,7 @@ const OPENAI_NCM_CONCURRENCY = Math.min(
   Math.max(Number.isFinite(OPENAI_NCM_CONCURRENCY_INPUT) ? Math.round(OPENAI_NCM_CONCURRENCY_INPUT) : 3, 1),
   8
 );
-const AI_LEARNING_ENABLED = String(process.env.AI_LEARNING_ENABLED || "false").toLowerCase() === "true";
+const AI_LEARNING_ENABLED = false;
 const MERCADO_PAGO_ACCESS_TOKEN = process.env.MERCADO_PAGO_ACCESS_TOKEN || "";
 const AI_BILLING_PRICE_CENTS = Math.min(Math.max(Number(process.env.AI_BILLING_PRICE_CENTS || 15), 1), 100000);
 const AI_BILLING_DEFAULT_ENABLED = true;
@@ -464,6 +464,7 @@ function setupDatabase() {
       filename TEXT,
       source_type TEXT NOT NULL,
       operation_type TEXT NOT NULL DEFAULT 'venda',
+      uf TEXT NOT NULL DEFAULT 'SP',
       imported_by TEXT NOT NULL DEFAULT 'sistema',
       row_count INTEGER NOT NULL DEFAULT 0,
       status TEXT NOT NULL DEFAULT 'processed',
@@ -492,6 +493,7 @@ function setupDatabase() {
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       product_id INTEGER NOT NULL UNIQUE,
       operation_type TEXT NOT NULL DEFAULT 'venda',
+      uf TEXT NOT NULL DEFAULT 'SP',
       sku TEXT,
       ean TEXT,
       ncm TEXT,
@@ -711,8 +713,12 @@ function setupDatabase() {
     );
   `);
 
+  ensureTableColumns("import_batches", [
+    { name: "uf", type: "TEXT NOT NULL DEFAULT 'SP'" }
+  ]);
   ensureTableColumns("classifications", [
     { name: "operation_type", type: "TEXT NOT NULL DEFAULT 'venda'" },
+    { name: "uf", type: "TEXT NOT NULL DEFAULT 'SP'" },
     { name: "sku", type: "TEXT" },
     { name: "ean", type: "TEXT" },
     { name: "aliquota_icms", type: "REAL" },
@@ -737,6 +743,11 @@ function setupDatabase() {
       ) VALUES (1, 'Empresa modelo Aikkie', '', '1', 'simples_nacional', 'SP', 'Sao Paulo', 1, ?)
     `).run(now());
   }
+
+  db.exec(`
+    DELETE FROM validated_rules;
+    DELETE FROM sqlite_sequence WHERE name = 'validated_rules';
+  `);
 
   seedCatalogs();
 }
@@ -963,6 +974,52 @@ function normalizeOperationType(value = "venda") {
   const normalized = normalizeText(value);
   if (["compra", "compras", "entrada"].includes(normalized)) return "compra";
   return "venda";
+}
+
+const BRAZIL_UFS = new Set([
+  "AC",
+  "AL",
+  "AP",
+  "AM",
+  "BA",
+  "CE",
+  "DF",
+  "ES",
+  "GO",
+  "MA",
+  "MT",
+  "MS",
+  "MG",
+  "PA",
+  "PB",
+  "PR",
+  "PE",
+  "PI",
+  "RJ",
+  "RN",
+  "RS",
+  "RO",
+  "RR",
+  "SC",
+  "SP",
+  "SE",
+  "TO"
+]);
+
+function normalizeUf(value, fallback = "SP") {
+  const clean = String(value ?? "")
+    .trim()
+    .toUpperCase()
+    .replace(/[^A-Z]/g, "")
+    .slice(0, 2);
+  if (BRAZIL_UFS.has(clean)) return clean;
+  const fallbackClean = String(fallback ?? "")
+    .trim()
+    .toUpperCase()
+    .replace(/[^A-Z]/g, "")
+    .slice(0, 2);
+  if (BRAZIL_UFS.has(fallbackClean)) return fallbackClean;
+  return fallback === "" ? "" : "SP";
 }
 
 function extractSearchCode(value = "") {
@@ -1501,6 +1558,19 @@ function getCompany() {
   return db.prepare("SELECT * FROM companies WHERE id = 1").get();
 }
 
+function getCompanyForFiscalUf(uf) {
+  const company = getCompany();
+  return {
+    ...company,
+    uf: normalizeUf(uf || company?.uf, "SP")
+  };
+}
+
+function getFiscalUfForClassification(classification) {
+  const company = getCompany();
+  return normalizeUf(classification?.uf || classification?.batch_uf || company?.uf, "SP");
+}
+
 function upsertCompany(input) {
   const current = getCompany();
   const next = {
@@ -1513,7 +1583,7 @@ function upsertCompany(input) {
     mei: input.mei ? 1 : 0,
     cnae_principal: input.cnae_principal ?? current.cnae_principal ?? "",
     cnaes_secundarios: input.cnaes_secundarios ?? current.cnaes_secundarios ?? "",
-    uf: String(input.uf ?? current.uf ?? "SP").toUpperCase(),
+    uf: normalizeUf(input.uf ?? current.uf ?? "SP"),
     municipio: input.municipio ?? current.municipio ?? "",
     codigo_municipio_ibge: input.codigo_municipio_ibge ?? current.codigo_municipio_ibge ?? "",
     contribuinte_icms: input.contribuinte_icms === false ? 0 : 1
@@ -1837,7 +1907,7 @@ function getFiscalTablesForNcm(ncm) {
   return {
     cest: db.prepare("SELECT * FROM cest WHERE ncm = ? OR ncm LIKE ? ORDER BY codigo_cest LIMIT 20").all(exactNcm, ncmPrefix),
     tipi: db.prepare("SELECT * FROM tipi WHERE ncm = ? OR ncm LIKE ? ORDER BY vigencia DESC LIMIT 20").all(exactNcm, ncmPrefix),
-    pis_cofins: db.prepare("SELECT * FROM regras_pis_cofins_por_ncm WHERE ncm = ? OR ncm = '00000000' ORDER BY ncm DESC LIMIT 10").all(exactNcm),
+    pis_cofins: db.prepare("SELECT * FROM regras_pis_cofins_por_ncm WHERE ncm = ? ORDER BY ncm DESC LIMIT 10").all(exactNcm),
     cbenef: db.prepare("SELECT * FROM cbenef_uf WHERE ncm = ? OR ncm LIKE ? ORDER BY uf, codigo_beneficio LIMIT 20").all(exactNcm, ncmPrefix),
     ibs_cbs_cst: db.prepare("SELECT * FROM ibs_cbs_cst ORDER BY codigo LIMIT 20").all(),
     ibs_cbs_classificacao: db.prepare("SELECT * FROM ibs_cbs_classificacao ORDER BY cclass_trib LIMIT 20").all()
@@ -1880,7 +1950,7 @@ function searchAllBases(rawQuery, tokens) {
       fields: ["descricao_base", "tipo_operacao", "segmento", "ncm", "cest", "cclass_trib", "aliquota_icms", "aliquota_pis", "aliquota_cofins", "aliquota_fcp"]
     }] : []),
     { key: "cfop_oficial", label: "CFOP oficial", table: "cfop_oficial", fields: ["codigo", "descricao", "tipo", "entrada_saida"] },
-    { key: "regras_cfop", label: "Regras CFOP", table: "regras_cfop", fields: ["tipo_operacao", "uf_origem", "uf_destino", "origem_mercadoria", "cfop"] },
+    { key: "regras_cfop", label: "CFOP por operacao", table: "regras_cfop", fields: ["tipo_operacao", "uf_origem", "uf_destino", "origem_mercadoria", "cfop"] },
     { key: "origem_mercadoria", label: "Origem da mercadoria", table: "origem_mercadoria", fields: ["codigo", "descricao"] },
     { key: "cst_icms", label: "CST ICMS", table: "cst_icms", fields: ["codigo", "descricao"] },
     { key: "csosn", label: "CSOSN", table: "csosn", fields: ["codigo", "descricao"] },
@@ -1890,7 +1960,7 @@ function searchAllBases(rawQuery, tokens) {
     { key: "ibs_cbs_classificacao", label: "cClassTrib IBS/CBS", table: "ibs_cbs_classificacao", fields: ["cclass_trib", "descricao", "cst_permitido", "indicadores"] },
     { key: "cest", label: "CEST/ST", table: "cest", fields: ["codigo_cest", "ncm", "descricao", "segmento", "item_segmento"] },
     { key: "tipi", label: "TIPI/IPI", table: "tipi", fields: ["ncm", "descricao", "ex_tipi", "vigencia"] },
-    { key: "regras_pis_cofins_por_ncm", label: "Regras PIS/COFINS por NCM", table: "regras_pis_cofins_por_ncm", fields: ["ncm", "tipo_incidencia"] },
+    { key: "regras_pis_cofins_por_ncm", label: "PIS/COFINS por NCM", table: "regras_pis_cofins_por_ncm", fields: ["ncm", "tipo_incidencia"] },
     { key: "cbenef_uf", label: "cBenef por UF", table: "cbenef_uf", fields: ["uf", "codigo_beneficio", "cst", "descricao", "ncm"] },
     { key: "ibge_municipios", label: "IBGE municípios", table: "ibge_municipios", fields: ["codigo_municipio_ibge", "nome_municipio", "uf", "codigo_uf"] },
     { key: "ibpt", label: "IBPT", table: "ibpt", fields: ["ncm", "uf", "fonte", "chave"] }
@@ -2026,7 +2096,7 @@ function aiNcmConfig() {
     layers: ["produto", "empresa", "operacao"],
     learning: {
       enabled: AI_LEARNING_ENABLED,
-      mode: AI_LEARNING_ENABLED ? "contador_validado" : "disabled"
+      mode: "removed"
     },
     policy: "O classificador usa whitelist da NCM oficial vigente, escolhe apenas entre candidatos validados e so aplica automaticamente com 90% ou mais, sem pergunta bloqueante."
   };
@@ -2662,25 +2732,27 @@ function buildNcmSearchQuery(productName) {
   return `${cleanProduct || "produto"} NCM`;
 }
 
-function buildFiscalSearchQueries(productName) {
+function buildFiscalSearchQueries(productName, uf = "") {
   const cleanProduct = String(productName || "").replace(/\s+/g, " ").trim() || "produto";
+  const fiscalUf = normalizeUf(uf, "");
+  const ufSuffix = fiscalUf ? ` ${fiscalUf}` : "";
   return {
     ncm: `${cleanProduct} NCM`,
-    cest: `${cleanProduct} CEST`,
-    cest_required: `${cleanProduct} CEST obrigatorio`,
-    ncm_cest: `${cleanProduct} NCM CEST`,
+    cest: `${cleanProduct} CEST ICMS ST${ufSuffix}`,
+    cest_required: `${cleanProduct} CEST obrigatorio${ufSuffix}`,
+    ncm_cest: `${cleanProduct} NCM CEST${ufSuffix}`,
     ex_tipi: `${cleanProduct} NCM EX TIPI TIPI IPI`,
     unidade: `${cleanProduct} unidade comercial unidade tributavel NCM`,
-    cfop: `${cleanProduct} CFOP venda compra dentro fora do estado`,
-    icms_st_fcp: `${cleanProduct} ICMS ST FCP CEST`,
+    cfop: `${cleanProduct} CFOP venda compra dentro fora do estado origem${ufSuffix}`,
+    icms_st_fcp: `${cleanProduct} ICMS ST FCP CEST aliquota${ufSuffix}`,
     pis_cofins: `${cleanProduct} PIS COFINS CST aliquota NCM`,
     ibs_cbs: `${cleanProduct} IBS CBS CST cClassTrib LC 214 2025 reducao aliquota zero beneficio fiscal`,
-    fiscal_full: `${cleanProduct} NCM CEST EX TIPI CFOP ICMS ST FCP PIS COFINS IPI IBS CBS cClassTrib beneficio fiscal`
+    fiscal_full: `${cleanProduct} NCM CEST EX TIPI CFOP ICMS ST FCP PIS COFINS IPI IBS CBS cClassTrib beneficio fiscal${ufSuffix}`
   };
 }
 
 async function fetchWebEvidence(productName, candidate, options = {}) {
-  const query = buildFiscalSearchQueries(productName).fiscal_full;
+  const query = buildFiscalSearchQueries(productName, options.uf).fiscal_full;
   if (!options.useWeb) {
     return { status: "not_requested", query, items: [] };
   }
@@ -3209,7 +3281,7 @@ function aiNcmInstructions() {
     "Voce e um motor de classificacao fiscal assistida para produtos vendidos no Brasil.",
     "Trabalhe em camadas: primeiro Produto, depois Empresa, depois Operacao. Nao misture CFOP/CSOSN/CST com NCM sem explicar a dependencia.",
     "Use as consultas em search_queries. Pesquise o produto com NCM, CEST, EX TIPI/TIPI, unidade comercial, CST/CSOSN, CFOP, ICMS/ST/FCP, PIS/COFINS, IPI, IBS/CBS, cClassTrib, beneficios e reducoes fiscais.",
-    "Use todos os dados enviados: base oficial/local NCM, candidatos ranqueados, contexto de empresa/operacao, tabelas fiscais locais e evidencia web quando existir. Ignore regras aprendidas antigas quando learning.enabled for false.",
+    "Use todos os dados enviados: base oficial/local NCM, candidatos ranqueados, contexto de empresa/operacao, tax_scope.uf, tabelas fiscais locais e evidencia web quando existir. O aprendizado por regra validada esta removido e nao deve influenciar a decisao.",
     "O codigo final de NCM deve estar em ncm_policy.allowed_ncms. Nunca retorne NCM fora dessa whitelist; se nenhum candidato da whitelist for compativel, retorne ncm '00000000', status 'insufficient_info' ou 'invalid_ncm' e should_apply false.",
     "Nao invente codigos. Quando a web apontar claramente um NCM, ele so pode ser usado se o backend colocou esse codigo em ncm_policy.allowed_ncms. Quando a web indicar que nao ha CEST especifico obrigatorio, reflita isso em field_suggestions e why.",
     "Se faltar composicao, material, finalidade, funcionamento ou uso e essa informacao puder mudar o NCM, NAO CLASSIFIQUE automaticamente. Retorne smart_questions bloqueantes, status 'insufficient_info' e should_apply false.",
@@ -3217,10 +3289,10 @@ function aiNcmInstructions() {
     "Se a confianca de NCM ficar abaixo de 0.90, deixe should_apply false e status review ou uncertain. Nao feche automaticamente abaixo de 90%.",
     "Diferencie produto base de acessorio ou uso: cabo eletrico, cabo de dados e cabo de fibra optica podem ter NCM diferente; lapis escolar nao e apontador; lapis de maquiagem e cosmetico; rolo de pintura nao e reagente; racao de gatos ou cachorros e alimento para animais.",
     "Priorize frase especifica, funcao principal, composicao, material, finalidade, funcionamento e uso sobre repeticao de palavra solta.",
-    "Para CEST e ICMS/ST: se existir CEST aplicavel ao NCM/produto/apresentacao, retorne o codigo e icms_st 'sim'; se a evidencia indicar que nao existe CEST obrigatorio especifico, retorne cest_required 'nao', cest 'SEM CEST OBRIGATORIO' e icms_st 'nao'.",
+    "Para CEST e ICMS/ST: use tax_scope.uf como UF fiscal. Se existir CEST aplicavel ao NCM/produto/apresentacao/UF, retorne o codigo e icms_st 'sim'; se a evidencia indicar que nao existe CEST obrigatorio especifico para essa UF/contexto, retorne cest_required 'nao', cest 'SEM CEST OBRIGATORIO' e icms_st 'nao'.",
     "Para SKU e EAN: preserve os identificadores enviados pelo produto; nao invente EAN. Se o codigo de barras vier vazio, retorne string vazia.",
-    "Para ICMS e FCP: preencha aliquota_icms e aliquota_fcp somente quando houver regra/tabela/evidencia clara para produto, UF e regime. Se depender de UF destino, beneficio estadual, ST ou consumidor final, use 0 e explique em observations/warnings.",
-    "Para CFOP: use o tipo de operacao e UF enviados, mas indique baixa confianca quando depender de destinatario, finalidade, consumidor final ou operacao nao informada.",
+    "Para ICMS, FCP e cBenef: preencha somente quando houver regra/tabela/evidencia clara para produto, tax_scope.uf, regime e operacao. Se depender de UF destino, beneficio estadual, ST, consumidor final ou enquadramento nao informado, deixe vazio ou 0 e explique em observations/warnings.",
+    "Para CFOP: use o tipo de operacao e a UF de origem em operation.uf_origem, mas indique baixa confianca quando depender de destinatario, finalidade, consumidor final ou operacao nao informada.",
     "Para IBS/CBS: nunca use CST 000 + cClassTrib 000001 como fallback generico. Pesquise a tabela vigente de cClassTrib/LC 214/2025 e beneficios/reducoes por NCM. Se houver reducao, aliquota zero ou cesta basica aplicavel, retorne o CST/cClassTrib especifico. Se nao houver certeza, deixe ibs_cbs_cst e cclass_trib vazios e explique.",
     "Para IPI/EX TIPI: pesquise TIPI pelo NCM; retorne aliquota IPI e EX TIPI somente quando houver evidencia. Se nao houver EX, retorne string vazia.",
     "Preencha why para o contador entender: identificado como, base oficial usada, evidencia, alternativas descartadas e recomendacao de revisao.",
@@ -3303,12 +3375,16 @@ function compactFiscalTableRows(rows = [], fields = []) {
   });
 }
 
-function compactFiscalTablesForAi(tables = {}) {
+function compactFiscalTablesForAi(tables = {}, uf = "") {
+  const fiscalUf = normalizeUf(uf, "");
+  const cbenefRows = fiscalUf
+    ? (tables.cbenef || []).filter((row) => row.uf === fiscalUf || row.uf === "*" || !row.uf)
+    : tables.cbenef;
   return {
     cest: compactFiscalTableRows(tables.cest, ["codigo_cest", "ncm", "descricao", "segmento"]),
     tipi: compactFiscalTableRows(tables.tipi, ["ncm", "aliquota_ipi", "ex_tipi", "descricao", "vigencia"]),
     pis_cofins: compactFiscalTableRows(tables.pis_cofins, ["ncm", "aliquota_pis", "aliquota_cofins", "tipo_incidencia"]),
-    cbenef: compactFiscalTableRows(tables.cbenef, ["uf", "codigo_beneficio", "descricao", "cst"]),
+    cbenef: compactFiscalTableRows(cbenefRows, ["uf", "codigo_beneficio", "descricao", "cst"]),
     ibs_cbs_cst: compactFiscalTableRows(tables.ibs_cbs_cst, ["codigo", "descricao"]),
     ibs_cbs_classificacao: compactFiscalTableRows(tables.ibs_cbs_classificacao, ["cclass_trib", "descricao", "cst_permitido"])
   };
@@ -3343,19 +3419,22 @@ function getNcmCatalogMetadata() {
 
 async function buildAiNcmContext(classification, options = {}) {
   const productText = `${classification.descricao_original || ""} ${classification.marca || ""} ${classification.categoria || ""}`.trim();
-  const searchQueries = buildFiscalSearchQueries(productText);
+  const fiscalUf = getFiscalUfForClassification(classification);
+  const searchQueries = buildFiscalSearchQueries(productText, fiscalUf);
   const currentCode = normalizeNcmCode(classification.ncm);
   const currentRow = getOfficialNcmRow(currentCode);
   const fiscal = searchFiscal(productText, OPENAI_NCM_MAX_CANDIDATES);
   const candidates = fiscal.ncm.slice(0, OPENAI_NCM_MAX_CANDIDATES).map(compactAiCandidate);
   const localCandidate = findNcmMatch({ ...classification, ncm_importado: "" }, extractTokens(productText), { useImportedNcm: false });
-  const company = getCompany();
+  const company = getCompanyForFiscalUf(fiscalUf);
   const operation = getOperationForClassification(classification);
   const cfops = getCfopPair(operation, company);
   const bestNcm = normalizeNcmCode(localCandidate?.codigo || currentCode);
-  const localFiscalTables = bestNcm && bestNcm !== "00000000" ? compactFiscalTablesForAi(getFiscalTablesForNcm(bestNcm)) : compactFiscalTablesForAi({});
+  const localFiscalTables = bestNcm && bestNcm !== "00000000"
+    ? compactFiscalTablesForAi(getFiscalTablesForNcm(bestNcm), fiscalUf)
+    : compactFiscalTablesForAi({}, fiscalUf);
   const useWeb = Boolean(options.use_web || options.useWeb);
-  const web = await fetchWebEvidence(productText, localCandidate, { useWeb });
+  const web = await fetchWebEvidence(productText, localCandidate, { useWeb, uf: fiscalUf });
   return {
     generated_at: now(),
     official_ncm_source: NCM_JSON_URL,
@@ -3373,19 +3452,26 @@ async function buildAiNcmContext(classification, options = {}) {
       codigo_barras: classification.codigo_barras || null,
       ean: classification.ean || classification.codigo_barras || null,
       marca: classification.marca || null,
-      categoria: classification.categoria || null
+      categoria: classification.categoria || null,
+      uf: fiscalUf
     },
     company: {
       nome: company.nome_fantasia || company.razao_social || "",
       cnpj: company.cnpj || "",
-      uf: company.uf || "SP",
+      uf: fiscalUf,
       municipio: company.municipio || "",
       regime_tributario: company.regime_tributario || "",
       crt: company.crt || "",
       contribuinte_icms: Boolean(company.contribuinte_icms)
     },
+    tax_scope: {
+      uf: fiscalUf,
+      source: classification.uf ? "classification" : classification.batch_uf ? "import_batch" : "company",
+      uf_deve_ser_usada_para: ["ICMS", "ICMS-ST", "FCP", "CEST", "cBenef", "beneficios estaduais"]
+    },
     operation: {
       type: operation,
+      uf_origem: fiscalUf,
       cfop_interno_default: cfops.interno,
       cfop_interestadual_default: cfops.interestadual,
       missing_context: ["destinatario", "uf_destino", "consumidor_final", "finalidade_da_operacao"]
@@ -3508,7 +3594,7 @@ async function callOpenAiNcmWebSearch(context) {
   const request = {
     model: OPENAI_NCM_MODEL,
     instructions:
-      "Pesquise na web o pacote fiscal brasileiro do produto: NCM, CEST/ICMS-ST, EX TIPI/TIPI, IPI, unidade comercial quando a descricao indicar peso ou unidade, PIS/COFINS, FCP, IBS/CBS, cClassTrib, beneficios e reducoes fiscais. Use search_queries.fiscal_full e as consultas especificas. Priorize Receita Federal, Portal NF-e, Siscomex, Confaz/Convenios ICMS e tabelas fiscais confiaveis com descricao especifica. Responda curto citando codigos encontrados por campo e indicando incertezas. Nao invente codigo.",
+      "Pesquise na web o pacote fiscal brasileiro do produto considerando tax_scope.uf: NCM, CEST/ICMS-ST, EX TIPI/TIPI, IPI, unidade comercial quando a descricao indicar peso ou unidade, PIS/COFINS, FCP, IBS/CBS, cClassTrib, beneficios e reducoes fiscais. Use search_queries.fiscal_full e as consultas especificas. Priorize Receita Federal, Portal NF-e, Siscomex, Confaz/Convenios ICMS, SEFAZ da UF e tabelas fiscais confiaveis com descricao especifica. Responda curto citando codigos encontrados por campo e indicando incertezas. Nao invente codigo.",
     input: [
       {
         role: "user",
@@ -3520,6 +3606,7 @@ async function callOpenAiNcmWebSearch(context) {
               search_queries: context.search_queries,
               product: context.product,
               company: context.company,
+              tax_scope: context.tax_scope,
               operation: context.operation,
               current: context.current,
               local_best: context.local_best,
@@ -4158,7 +4245,7 @@ function buildFieldSuggestions(ai = {}, context = {}, code = "", description = "
   );
   const cfopInternal = asCleanString(suggestion.cfop_internal, context.operation?.cfop_interno_default || "");
   const cfopInterstate = asCleanString(suggestion.cfop_interstate, context.operation?.cfop_interestadual_default || "");
-  const pisCofins = trustedCode && trustedCode !== "00000000" ? getPisCofins(trustedCode) : getPisCofins("00000000");
+  const pisCofins = trustedCode && trustedCode !== "00000000" ? getPisCofins(trustedCode) : null;
   const tipiRow = tables.tipi?.[0] || null;
 
   return {
@@ -4199,13 +4286,13 @@ function buildFieldSuggestions(ai = {}, context = {}, code = "", description = "
     ),
     origem: asCleanString(suggestion.origem, "0"),
     cst_pis: asCleanString(suggestion.cst_pis, getPisCofinsCst(pisCofins)),
-    aliquota_pis: numberOrFallback(suggestion.aliquota_pis, Number(pisCofins?.aliquota_pis ?? 1.65)),
+    aliquota_pis: numberOrFallback(suggestion.aliquota_pis, pisCofins?.aliquota_pis),
     pis_cofins_reason: asCleanString(
       suggestion.pis_cofins_reason,
-      pisCofins?.tipo_incidencia ? `Regra PIS/COFINS local por NCM: ${pisCofins.tipo_incidencia}.` : "PIS/COFINS precisa de validacao por NCM/regime."
+      pisCofins?.tipo_incidencia ? `Tabela PIS/COFINS local por NCM: ${pisCofins.tipo_incidencia}.` : "PIS/COFINS precisa de validacao por NCM/regime."
     ),
     cst_cofins: asCleanString(suggestion.cst_cofins, getPisCofinsCst(pisCofins)),
-    aliquota_cofins: numberOrFallback(suggestion.aliquota_cofins, Number(pisCofins?.aliquota_cofins ?? 7.6)),
+    aliquota_cofins: numberOrFallback(suggestion.aliquota_cofins, pisCofins?.aliquota_cofins),
     aliquota_fcp: numberOrFallback(suggestion.aliquota_fcp, null),
     ibs_cbs_cst: nonGenericFiscalValue(suggestion.ibs_cbs_cst, ["000"]),
     cclass_trib: nonGenericFiscalValue(suggestion.cclass_trib, ["000001"]),
@@ -4231,6 +4318,7 @@ function buildFieldSuggestions(ai = {}, context = {}, code = "", description = "
 
 function buildFiscalLayers(ai = {}, context = {}, fieldSuggestions = {}, profile = {}) {
   const layers = ai.fiscal_layers || {};
+  const fiscalUf = context.tax_scope?.uf || context.company?.uf || "";
   return {
     produto: {
       ncm: asCleanString(layers.produto?.ncm, fieldSuggestions.ncm || "00000000"),
@@ -4243,8 +4331,8 @@ function buildFiscalLayers(ai = {}, context = {}, fieldSuggestions = {}, profile
     },
     empresa: {
       regime: asCleanString(layers.empresa?.regime, context.company?.regime_tributario || ""),
-      uf: asCleanString(layers.empresa?.uf, context.company?.uf || ""),
-      impacto: asCleanString(layers.empresa?.impacto, "Regime, UF e contribuinte ICMS afetam CST/CSOSN, beneficios e regras estaduais.")
+      uf: asCleanString(layers.empresa?.uf, fiscalUf),
+      impacto: asCleanString(layers.empresa?.impacto, `Regime, UF ${fiscalUf || "-"} e contribuinte ICMS afetam CST/CSOSN, beneficios e regras estaduais.`)
     },
     operacao: {
       tipo: asCleanString(layers.operacao?.tipo, context.operation?.type || ""),
@@ -4267,7 +4355,7 @@ function buildWhy(ai = {}, context = {}, code = "", description = "", questions 
   return {
     identified_as: asCleanString(why.identified_as, asCleanString(ai.product_category, context.product?.descricao || "")),
     official_basis: asCleanString(why.official_basis, description ? `NCM oficial: ${description}` : "Base oficial/local NCM e evidencia web consultadas."),
-    evidence_summary: asCleanString(why.evidence_summary, asCleanString(ai.reason, "Classificacao feita por candidatos oficiais, regras locais e pesquisa web.")),
+    evidence_summary: asCleanString(why.evidence_summary, asCleanString(ai.reason, "Classificacao feita por candidatos oficiais, tabelas locais e pesquisa web.")),
     discarded_alternatives: alternatives.slice(0, 6),
     review_recommendation: asCleanString(
       why.review_recommendation,
@@ -4680,7 +4768,8 @@ function resolveIbsCbsPatch(previous, suggested = {}) {
 }
 
 function buildFiscalPatchFromNcm(previous, ncm, aiResult = null) {
-  const company = getCompany();
+  const fiscalUf = getFiscalUfForClassification(previous);
+  const company = getCompanyForFiscalUf(fiscalUf);
   const operation = getOperationForClassification(previous);
   const cfops = getCfopPair(operation, company);
   const tables = getFiscalTablesForNcm(ncm);
@@ -4702,8 +4791,8 @@ function buildFiscalPatchFromNcm(previous, ncm, aiResult = null) {
   );
   const finalCfopInterno = asCleanString(suggested.cfop_internal, cfops.interno);
   const finalCfopInterestadual = asCleanString(suggested.cfop_interstate, cfops.interestadual);
-  const finalPis = asCleanString(suggested.cst_pis, pisCofinsCst);
-  const finalCofins = asCleanString(suggested.cst_cofins, pisCofinsCst);
+  const finalPis = asCleanString(suggested.cst_pis, pisCofinsCst || previous.cst_pis);
+  const finalCofins = asCleanString(suggested.cst_cofins, pisCofinsCst || previous.cst_cofins);
   const suggestedCsosn = asCleanString(suggested.csosn);
   const suggestedCstIcms = asCleanString(suggested.cst_icms);
   const finalCsosn = simples
@@ -5287,7 +5376,7 @@ async function handleMercadoPagoBillingWebhook(body = {}, query = {}) {
 }
 
 function getCfopPair(operationType, company) {
-  const origem = company.uf || "SP";
+  const origem = normalizeUf(company?.uf, "SP");
   const internal = db.prepare(`
     SELECT cfop FROM regras_cfop
     WHERE tipo_operacao = ? AND (uf_origem = ? OR uf_origem = '*') AND uf_destino = ?
@@ -5306,13 +5395,15 @@ function getCfopPair(operationType, company) {
   };
 }
 
-function getPisCofins(ncm) {
+function getPisCofins(ncm, options = {}) {
   const exact = db.prepare("SELECT * FROM regras_pis_cofins_por_ncm WHERE ncm = ? LIMIT 1").get(ncm);
-  const fallback = db.prepare("SELECT * FROM regras_pis_cofins_por_ncm WHERE ncm = '00000000' LIMIT 1").get();
-  return exact || fallback || { aliquota_pis: 1.65, aliquota_cofins: 7.6, tipo_incidencia: "basica" };
+  if (exact) return exact;
+  if (!options.allowFallback) return null;
+  return db.prepare("SELECT * FROM regras_pis_cofins_por_ncm WHERE ncm = '00000000' LIMIT 1").get() || null;
 }
 
 function getPisCofinsCst(pisCofins = {}) {
+  if (!pisCofins) return "";
   const incidence = normalizeText(pisCofins.tipo_incidencia || "");
   if (incidence.includes("monofasica")) return "04";
   if (incidence.includes("zero")) return "06";
@@ -5332,7 +5423,7 @@ function getIbptEstimate(ncm, company, price) {
       LIMIT 1
     `
     )
-    .get(company.uf || "SP", ncm, `${String(ncm || "").slice(0, 4)}%`, ncm);
+    .get(normalizeUf(company?.uf, "SP"), ncm, `${String(ncm || "").slice(0, 4)}%`, ncm);
   if (!row) return null;
   const totalRate = Number(row.aliquota_federal || 0) + Number(row.aliquota_estadual || 0) + Number(row.aliquota_municipal || 0);
   return Number(((itemPrice * totalRate) / 100).toFixed(2));
@@ -5340,7 +5431,8 @@ function getIbptEstimate(ncm, company, price) {
 
 function pickFiscalBenefit(tables, company) {
   const benefits = tables.cbenef || [];
-  return benefits.find((item) => item.uf === company.uf) || benefits.find((item) => item.uf === "*") || benefits[0] || null;
+  const fiscalUf = normalizeUf(company?.uf, "");
+  return benefits.find((item) => item.uf === fiscalUf) || benefits.find((item) => item.uf === "*") || null;
 }
 
 function pickIbsCbsClassification(tables, cst) {
@@ -5348,15 +5440,16 @@ function pickIbsCbsClassification(tables, cst) {
   return rows.find((item) => String(item.cst_permitido || "").split(/[,\s]+/).includes(cst)) || rows[0] || null;
 }
 
-function classifyProduct(product, operationType = "venda") {
-  const company = getCompany();
+function classifyProduct(product, operationType = "venda", uf = "") {
+  const baseCompany = getCompany();
+  const fiscalUf = normalizeUf(uf || product.uf, baseCompany?.uf || "SP");
+  const company = getCompanyForFiscalUf(fiscalUf);
   const operation = normalizeOperationType(operationType);
   const tokens = extractTokens(`${product.descricao_original} ${product.marca || ""} ${product.categoria || ""}`);
-  const validated = findValidatedRule(tokens, 1, operation);
+  const validated = null;
   const ncmMatch = findNcmMatch(product, tokens);
   const cfops = getCfopPair(operation, company);
   const pisCofins = getPisCofins(ncmMatch.codigo);
-  const simples = company.regime_tributario === "simples_nacional" || company.crt === "1" || company.crt === "4";
 
   const confidenceParts = [
     ncmMatch.score,
@@ -5369,41 +5462,40 @@ function classifyProduct(product, operationType = "venda") {
 
   return {
     operation_type: operation,
+    uf: fiscalUf,
     sku: product.codigo_produto || null,
     ean: product.codigo_barras || null,
-    ncm: validated?.ncm || ncmMatch.codigo,
-    cest: validated?.cest || null,
-    cfop_interno: validated?.cfop_padrao_interno || cfops.interno,
-    cfop_interestadual: validated?.cfop_padrao_interestadual || cfops.interestadual,
-    cst_icms: simples ? null : validated?.cst_icms || "00",
-    aliquota_icms: numberOrFallback(validated?.aliquota_icms, null),
-    icms_st: validated?.cest ? "sim" : "incerto",
-    csosn: simples ? validated?.csosn || "102" : null,
+    ncm: ncmMatch.codigo,
+    cest: null,
+    cfop_interno: cfops.interno,
+    cfop_interestadual: cfops.interestadual,
+    cst_icms: null,
+    aliquota_icms: null,
+    icms_st: "incerto",
+    csosn: null,
     origem: "0",
-    cst_pis: validated?.pis || "01",
-    aliquota_pis: numberOrFallback(validated?.aliquota_pis, pisCofins.aliquota_pis),
-    cst_cofins: validated?.cofins || "01",
-    aliquota_cofins: numberOrFallback(validated?.aliquota_cofins, pisCofins.aliquota_cofins),
-    aliquota_fcp: numberOrFallback(validated?.aliquota_fcp, null),
-    ibs_cbs_cst: validated?.ibs_cbs_cst || null,
-    cclass_trib: validated?.cclass_trib || null,
+    cst_pis: getPisCofinsCst(pisCofins) || null,
+    aliquota_pis: numberOrFallback(pisCofins?.aliquota_pis, null),
+    cst_cofins: getPisCofinsCst(pisCofins) || null,
+    aliquota_cofins: numberOrFallback(pisCofins?.aliquota_cofins, null),
+    aliquota_fcp: null,
+    ibs_cbs_cst: null,
+    cclass_trib: null,
     ipi: null,
     ex_tipi: null,
     cbenef: null,
     vtottrib: null,
     confianca: Number(confidence.toFixed(2)),
-    status: confidence >= 0.88 && validated ? "suggested_high_confidence" : "pending_review",
-    observacao: validated
-      ? "Sugerido por regra validada anteriormente pelo contador."
-      : "Sugestao automatica. Revisar antes de exportar.",
+    status: "pending_review",
+    observacao: "Pre-classificacao inicial sem aprendizado legado. Use Auto Classificar Produtos para completar os campos fiscais com contexto de UF.",
     sugestao_json: {
       tokens,
       ncm: ncmMatch,
-      regra_validada_id: validated?.id || null,
+      aprendizado_legado: "disabled",
       empresa: {
         crt: company.crt,
         regime_tributario: company.regime_tributario,
-        uf: company.uf,
+        uf: fiscalUf,
         contribuinte_icms: Boolean(company.contribuinte_icms)
       },
       operacao: operation,
@@ -5412,16 +5504,18 @@ function classifyProduct(product, operationType = "venda") {
   };
 }
 
-function createImportBatch({ filename, sourceType, operationType, importedBy, rowCount }) {
+function createImportBatch({ filename, sourceType, operationType, uf, importedBy, rowCount }) {
   const operation = normalizeOperationType(operationType);
+  const fiscalUf = normalizeUf(uf, getCompany()?.uf || "SP");
   const result = db.prepare(`
-    INSERT INTO import_batches (filename, source_type, operation_type, imported_by, row_count, created_at)
-    VALUES (?, ?, ?, ?, ?, ?)
-  `).run(filename || null, sourceType, operation, importedBy || "sistema", rowCount || 0, now());
+    INSERT INTO import_batches (filename, source_type, operation_type, uf, imported_by, row_count, created_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
+  `).run(filename || null, sourceType, operation, fiscalUf, importedBy || "sistema", rowCount || 0, now());
   return Number(result.lastInsertRowid);
 }
 
-function insertProduct(batchId, product, operationType) {
+function insertProduct(batchId, product, operationType, uf = "") {
+  const fiscalUf = normalizeUf(product.uf || uf, getCompany()?.uf || "SP");
   const descricaoTratada = normalizeText(product.descricao_original);
   const result = db.prepare(`
     INSERT INTO products (
@@ -5445,17 +5539,18 @@ function insertProduct(batchId, product, operationType) {
   );
   const productId = Number(result.lastInsertRowid);
   const operation = normalizeOperationType(operationType);
-  const classification = classifyProduct({ ...product, descricao_tratada: descricaoTratada }, operation);
+  const classification = classifyProduct({ ...product, descricao_tratada: descricaoTratada, uf: fiscalUf }, operation, fiscalUf);
   db.prepare(`
     INSERT INTO classifications (
-      product_id, operation_type, sku, ean, ncm, cest, cfop_interno, cfop_interestadual, cst_icms,
+      product_id, operation_type, uf, sku, ean, ncm, cest, cfop_interno, cfop_interestadual, cst_icms,
       aliquota_icms, icms_st, csosn, origem, cst_pis, aliquota_pis, cst_cofins, aliquota_cofins,
       aliquota_fcp, ibs_cbs_cst,
       cclass_trib, ipi, ex_tipi, cbenef, vtottrib, confianca, status, observacao, sugestao_json, updated_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `).run(
     productId,
     operation,
+    classification.uf,
     classification.sku,
     classification.ean,
     classification.ncm,
@@ -5487,26 +5582,29 @@ function insertProduct(batchId, product, operationType) {
   return productId;
 }
 
-function importProducts({ products, filename, sourceType, operationType, importedBy }) {
+function importProducts({ products, filename, sourceType, operationType, uf, importedBy }) {
   const cleanProducts = products
     .map((product, index) => mapProductRow(product, index))
     .filter((product) => product.descricao_original);
   const operation = normalizeOperationType(operationType);
+  const fiscalUf = normalizeUf(uf, getCompany()?.uf || "SP");
   const batchId = createImportBatch({
     filename,
     sourceType,
     operationType: operation,
+    uf: fiscalUf,
     importedBy,
     rowCount: cleanProducts.length
   });
-  const ids = cleanProducts.map((product) => insertProduct(batchId, product, operation));
+  const ids = cleanProducts.map((product) => insertProduct(batchId, { ...product, uf: fiscalUf }, operation, fiscalUf));
   logAudit("import_batch", batchId, "import", importedBy || "sistema", null, {
     filename,
     sourceType,
     operationType: operation,
+    uf: fiscalUf,
     rowCount: cleanProducts.length
   });
-  return { batchId, imported: ids.length, operationType: operation };
+  return { batchId, imported: ids.length, operationType: operation, uf: fiscalUf };
 }
 
 function rowToClassification(row) {
@@ -5515,6 +5613,7 @@ function rowToClassification(row) {
     product_id: row.product_id,
     batch_id: row.batch_id,
     operation_type: normalizeOperationType(row.operation_type || row.batch_operation_type || "venda"),
+    uf: normalizeUf(row.uf || row.batch_uf || getCompany()?.uf, "SP"),
     codigo_produto: row.codigo_produto,
     descricao_original: row.descricao_original,
     descricao_tratada: row.descricao_tratada,
@@ -5576,7 +5675,8 @@ function listClassifications(params = {}) {
       p.id AS product_id, p.batch_id, p.codigo_produto, p.descricao_original,
       p.descricao_tratada, p.unidade, p.preco, p.codigo_barras, p.peso,
       p.marca, p.categoria, p.ncm_importado, p.created_at,
-      ib.operation_type AS batch_operation_type
+      ib.operation_type AS batch_operation_type,
+      ib.uf AS batch_uf
     FROM classifications c
     JOIN products p ON p.id = c.product_id
     LEFT JOIN import_batches ib ON ib.id = p.batch_id
@@ -5597,7 +5697,8 @@ function getClassification(id) {
       p.id AS product_id, p.batch_id, p.codigo_produto, p.descricao_original,
       p.descricao_tratada, p.unidade, p.preco, p.codigo_barras, p.peso,
       p.marca, p.categoria, p.ncm_importado, p.created_at,
-      ib.operation_type AS batch_operation_type
+      ib.operation_type AS batch_operation_type,
+      ib.uf AS batch_uf
     FROM classifications c
     JOIN products p ON p.id = c.product_id
     LEFT JOIN import_batches ib ON ib.id = p.batch_id
@@ -5611,6 +5712,7 @@ function updateClassification(id, patch, actor = "contador") {
   if (!previous) return null;
   const allowed = [
     "operation_type",
+    "uf",
     "sku",
     "ean",
     "ncm",
@@ -5642,16 +5744,26 @@ function updateClassification(id, patch, actor = "contador") {
     if (Object.prototype.hasOwnProperty.call(patch, field)) next[field] = patch[field] === "" ? null : patch[field];
   }
   next.operation_type = normalizeOperationType(next.operation_type || previous.operation_type || "venda");
-  if (Object.prototype.hasOwnProperty.call(patch, "operation_type") && next.operation_type !== previous.operation_type) {
-    const cfops = getCfopPair(next.operation_type, getCompany());
+  next.uf = normalizeUf(next.uf || previous.uf || getCompany()?.uf, "SP");
+  const operationChanged = Object.prototype.hasOwnProperty.call(patch, "operation_type") && next.operation_type !== previous.operation_type;
+  const ufChanged = Object.prototype.hasOwnProperty.call(patch, "uf") && next.uf !== previous.uf;
+  if (operationChanged || ufChanged) {
+    const cfops = getCfopPair(next.operation_type, getCompanyForFiscalUf(next.uf));
     next.cfop_interno = cfops.interno;
     next.cfop_interestadual = cfops.interestadual;
-    const operationNote = `Operacao alterada para ${next.operation_type}; CFOP recalculado automaticamente.`;
+    if (ufChanged) {
+      const stateFields = ["cest", "aliquota_icms", "aliquota_fcp", "cbenef", "vtottrib"];
+      for (const field of stateFields) {
+        if (!Object.prototype.hasOwnProperty.call(patch, field)) next[field] = null;
+      }
+      if (!Object.prototype.hasOwnProperty.call(patch, "icms_st")) next.icms_st = "incerto";
+    }
+    const operationNote = `${operationChanged ? `Operacao alterada para ${next.operation_type}` : "UF fiscal alterada"}; CFOP recalculado para UF ${next.uf}.`;
     next.observacao = next.observacao ? `${next.observacao} ${operationNote}` : operationNote;
   }
   db.prepare(`
     UPDATE classifications SET
-      operation_type = ?, sku = ?, ean = ?, ncm = ?, cest = ?, cfop_interno = ?, cfop_interestadual = ?,
+      operation_type = ?, uf = ?, sku = ?, ean = ?, ncm = ?, cest = ?, cfop_interno = ?, cfop_interestadual = ?,
       cst_icms = ?, aliquota_icms = ?, icms_st = ?, csosn = ?, origem = ?, cst_pis = ?,
       aliquota_pis = ?, cst_cofins = ?, aliquota_cofins = ?, aliquota_fcp = ?,
       ibs_cbs_cst = ?, cclass_trib = ?, ipi = ?, ex_tipi = ?, cbenef = ?, vtottrib = ?,
@@ -5659,6 +5771,7 @@ function updateClassification(id, patch, actor = "contador") {
     WHERE id = ?
   `).run(
     next.operation_type,
+    next.uf,
     next.sku,
     next.ean,
     next.ncm,
@@ -5696,10 +5809,10 @@ function reclassifyClassification(id, actor = "contador") {
   const previous = getClassification(id);
   if (!previous) return null;
   const operation = getOperationForClassification(previous);
-  const suggestion = classifyProduct(previous, operation);
+  const suggestion = classifyProduct(previous, operation, previous.uf);
   db.prepare(`
     UPDATE classifications SET
-      operation_type = ?, sku = ?, ean = ?, ncm = ?, cest = ?, cfop_interno = ?, cfop_interestadual = ?,
+      operation_type = ?, uf = ?, sku = ?, ean = ?, ncm = ?, cest = ?, cfop_interno = ?, cfop_interestadual = ?,
       cst_icms = ?, aliquota_icms = ?, icms_st = ?, csosn = ?, origem = ?, cst_pis = ?,
       aliquota_pis = ?, cst_cofins = ?, aliquota_cofins = ?, aliquota_fcp = ?,
       ibs_cbs_cst = ?, cclass_trib = ?, ipi = ?, ex_tipi = ?, cbenef = ?, vtottrib = ?,
@@ -5707,6 +5820,7 @@ function reclassifyClassification(id, actor = "contador") {
     WHERE id = ?
   `).run(
     suggestion.operation_type,
+    suggestion.uf,
     suggestion.sku,
     suggestion.ean,
     suggestion.ncm,
@@ -5896,7 +6010,7 @@ function getCatalogs() {
     cst_cofins: db.prepare("SELECT * FROM cst_cofins ORDER BY codigo").all(),
     ibs_cbs_cst: db.prepare("SELECT * FROM ibs_cbs_cst ORDER BY codigo").all(),
     ibs_cbs_classificacao: db.prepare("SELECT * FROM ibs_cbs_classificacao ORDER BY cclass_trib").all(),
-    validated_rules: db.prepare("SELECT * FROM validated_rules ORDER BY data_validacao DESC LIMIT 100").all()
+    validated_rules: []
   };
 }
 
@@ -5925,6 +6039,7 @@ const EXPORT_PRODUCT_HEADERS = [
   "SKU",
   "EAN",
   "Unidade",
+  "UF",
   "Operacao",
   "NCM",
   "CEST",
@@ -5970,6 +6085,7 @@ function buildExportRows() {
     SKU: item.sku || item.codigo_produto || "",
     EAN: item.ean || item.codigo_barras || "",
     Unidade: item.unidade || "UN",
+    UF: item.uf || "",
     Operacao: item.operation_type === "compra" ? "Compra" : "Venda",
     NCM: item.ncm || "",
     CEST: item.cest || "",
@@ -6357,6 +6473,7 @@ async function handleRequest(req, res) {
       filename: "cadastro-manual",
       sourceType: "manual",
       operationType: payload.operation_type || "venda",
+      uf: payload.uf || getCompany()?.uf || "SP",
       importedBy: payload.actor || "contador"
     });
     return sendJson(res, 201, result);
@@ -6376,6 +6493,7 @@ async function handleRequest(req, res) {
         filename: file.filename,
         sourceType: extname(file.filename).replace(".", "") || "arquivo",
         operationType: form.fields.operation_type || "venda",
+        uf: form.fields.uf || getCompany()?.uf || "SP",
         importedBy: form.fields.imported_by || "contador"
       });
       return sendJson(res, 201, result);
@@ -6388,6 +6506,7 @@ async function handleRequest(req, res) {
       filename: payload.filename || "json",
       sourceType: payload.source_type || "json",
       operationType: payload.operation_type || "venda",
+      uf: payload.uf || getCompany()?.uf || "SP",
       importedBy: payload.imported_by || "contador"
     });
     return sendJson(res, 201, result);
