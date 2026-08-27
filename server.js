@@ -41,11 +41,15 @@ const OPENAI_NCM_MODEL = process.env.OPENAI_NCM_MODEL || "gpt-5-mini";
 const OPENAI_NCM_API_URL = process.env.OPENAI_NCM_API_URL || "https://api.openai.com/v1/responses";
 const OPENAI_NCM_APPLY_THRESHOLD = Math.min(Math.max(Number(process.env.OPENAI_NCM_APPLY_THRESHOLD || 0.9), 0.9), 0.99);
 const OPENAI_NCM_TIMEOUT_MS = Math.min(Math.max(Number(process.env.OPENAI_NCM_TIMEOUT_MS || 30000), 8000), 90000);
-const OPENAI_NCM_MAX_OUTPUT_TOKENS = Math.min(Math.max(Number(process.env.OPENAI_NCM_MAX_OUTPUT_TOKENS || 1800), 800), 3500);
+const OPENAI_NCM_MAX_OUTPUT_TOKENS_INPUT = Number(process.env.OPENAI_NCM_MAX_OUTPUT_TOKENS || 3500);
+const OPENAI_NCM_MAX_OUTPUT_TOKENS = Math.min(
+  Math.max(Number.isFinite(OPENAI_NCM_MAX_OUTPUT_TOKENS_INPUT) ? OPENAI_NCM_MAX_OUTPUT_TOKENS_INPUT : 3500, 3500),
+  5000
+);
 const OPENAI_NCM_WEB_SEARCH_ENABLED = String(process.env.OPENAI_NCM_WEB_SEARCH_ENABLED || "true").toLowerCase() !== "false";
-// O classificador processa um produto por vez para evitar concorrencia entre
-// pesquisas web, respostas e atualizacoes fiscais da mesma lista.
-const OPENAI_NCM_CONCURRENCY = 1;
+// O classificador processa ate cinco produtos por vez para equilibrar
+// velocidade, limite de saida e estabilidade das pesquisas web.
+const OPENAI_NCM_CONCURRENCY = 5;
 const MERCADO_PAGO_ACCESS_TOKEN = process.env.MERCADO_PAGO_ACCESS_TOKEN || "";
 const AI_BILLING_PRICE_CENTS = Math.min(Math.max(Number(process.env.AI_BILLING_PRICE_CENTS || 15), 1), 100000);
 const AI_BILLING_DEFAULT_ENABLED = true;
@@ -2964,6 +2968,129 @@ function parseOpenAiJsonOutput(outputText) {
   return null;
 }
 
+function escapeRegex(value = "") {
+  return String(value).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function extractFiscalLabelValue(text, labels = []) {
+  const normalized = normalizeText(text).replace(/\r/g, "");
+  const pattern = labels
+    .map((label) => normalizeText(label))
+    .filter(Boolean)
+    .map(escapeRegex)
+    .join("|");
+  if (!pattern) return "";
+  const match = new RegExp(
+    `(?:^|\\n)\\s*(?:[*#-]+\\s*)?(?:${pattern})\\s*[^\\n:]{0,100}?\\s*:\\s*([^\\n]+)`,
+    "im"
+  ).exec(normalized);
+  return match?.[1]?.replace(/\*+/g, "").trim() || "";
+}
+
+function extractFiscalDigits(value, minLength = 1, maxLength = 8) {
+  const candidates = String(value || "").match(/\d[\d./-]*/g) || [];
+  for (const candidate of candidates) {
+    const digits = candidate.replace(/\D/g, "");
+    if (digits.length >= minLength && digits.length <= maxLength) return digits;
+  }
+  return "";
+}
+
+function extractFiscalPercent(value) {
+  const match = String(value || "").match(/-?\d+(?:[.,]\d+)?/);
+  return match ? match[0].replace(",", ".") : "";
+}
+
+function parseOpenAiFiscalText(outputText, context = {}) {
+  const text = String(outputText || "").trim();
+  if (!text) return null;
+
+  const ncmLine = extractFiscalLabelValue(text, ["NCM"]);
+  const ncm = extractNcmCodesFromText(ncmLine || text)[0] || "";
+  if (!ncm || ncm === "00000000") return null;
+
+  const cestLine = extractFiscalLabelValue(text, ["CEST"]);
+  const cest = extractCestCodesFromText(cestLine)[0] ||
+    (isNoCestSignal(cestLine || text) ? "SEM CEST OBRIGATORIO" : "");
+  const description = extractFiscalLabelValue(text, ["Descricao", "Descricao fiscal"]) || context.product?.descricao || "";
+  const eanLine = extractFiscalLabelValue(text, ["EAN/GTIN", "EAN", "GTIN"]);
+  const eanIsSynthetic = /exemplo|generico|simulad|placeholder|padrao|utilize o codigo/.test(normalizeText(eanLine));
+  const ean = eanIsSynthetic ? "" : extractFiscalDigits(eanLine, 8, 14);
+  const sku = context.product?.sku || context.product?.codigo_produto || extractFiscalLabelValue(text, ["SKU"]);
+  const unidade = extractFiscalLabelValue(text, ["Unidade"]) || context.product?.unidade || "";
+  const origem = extractFiscalDigits(extractFiscalLabelValue(text, ["Origem da mercadoria", "Origem"]), 1, 1);
+  const cfopInterno = extractFiscalDigits(extractFiscalLabelValue(text, ["CFOP interno", "CFOP Interno"]), 4, 4);
+  const cfopInterestadual = extractFiscalDigits(extractFiscalLabelValue(text, ["CFOP interestadual", "CFOP Interestadual"]), 4, 4);
+  const cstIcms = extractFiscalDigits(extractFiscalLabelValue(text, ["CST ICMS"]), 2, 3);
+  const csosn = extractFiscalDigits(extractFiscalLabelValue(text, ["CSOSN"]), 3, 3);
+  const aliquotaIcms = extractFiscalPercent(extractFiscalLabelValue(text, ["Aliquota ICMS"]));
+  const icmsSt = extractFiscalLabelValue(text, ["ICMS-ST", "ICMS/ST"]);
+  const aliquotaFcp = extractFiscalPercent(extractFiscalLabelValue(text, ["FCP", "Aliquota FCP"]));
+  const cstPis = extractFiscalDigits(extractFiscalLabelValue(text, ["CST PIS"]), 2, 2);
+  const aliquotaPis = extractFiscalPercent(extractFiscalLabelValue(text, ["Aliquota PIS"]));
+  const cstCofins = extractFiscalDigits(extractFiscalLabelValue(text, ["CST COFINS"]), 2, 2);
+  const aliquotaCofins = extractFiscalPercent(extractFiscalLabelValue(text, ["Aliquota COFINS"]));
+  const cstIpi = extractFiscalDigits(extractFiscalLabelValue(text, ["CST IPI"]), 2, 2);
+  const aliquotaIpi = extractFiscalPercent(extractFiscalLabelValue(text, ["Aliquota IPI"]));
+  const exTipi = extractFiscalLabelValue(text, ["EX TIPI"]);
+  const cenq = extractFiscalDigits(extractFiscalLabelValue(text, ["cEnq", "Enquadramento do IPI"]), 3, 3);
+  const ibsCbsCst = extractFiscalDigits(extractFiscalLabelValue(text, ["CST IBS/CBS", "CST IBS CBS"]), 2, 3);
+  const cclassTrib = extractFiscalDigits(extractFiscalLabelValue(text, ["cClassTrib", "CClassTrib"]), 6, 6);
+  const aliquotaIbsUf = extractFiscalPercent(extractFiscalLabelValue(text, ["Aliquota IBS UF"]));
+  const aliquotaIbsMunicipio = extractFiscalPercent(extractFiscalLabelValue(text, ["Aliquota IBS Municipio"]));
+  const aliquotaCbs = extractFiscalPercent(extractFiscalLabelValue(text, ["Aliquota CBS"]));
+  const cbenefLine = extractFiscalLabelValue(text, ["cBenef", "CBenef"]);
+  const cbenef = /nao aplicavel|nao se aplica|sem beneficio|sem benef/.test(normalizeText(cbenefLine)) ? "SEM CBENEF" : cbenefLine;
+  const vtottrib = extractFiscalPercent(extractFiscalLabelValue(text, ["vTotTrib", "Valor Total dos Tributos"]));
+  const confidence = extractFiscalPercent(extractFiscalLabelValue(text, ["Confianca", "Confianca NCM"]));
+
+  return {
+    request_id: context.request_id || "",
+    sku,
+    descricao_original: context.product?.descricao || description,
+    ncm,
+    confianca_ncm: confidence ? Number(confidence) / 100 : 0.9,
+    cest_possivel: cest,
+    confianca_cest: cest ? 0.85 : 0.35,
+    dados_fiscais: {
+      sku,
+      ean_gtin: ean,
+      descricao: description,
+      ncm,
+      cest,
+      unidade,
+      origem,
+      cfop_interno: cfopInterno,
+      cfop_interestadual: cfopInterestadual,
+      cst_icms: cstIcms,
+      csosn,
+      aliquota_icms: aliquotaIcms,
+      icms_st: icmsSt,
+      aliquota_fcp: aliquotaFcp,
+      cst_pis: cstPis,
+      aliquota_pis: aliquotaPis,
+      cst_cofins: cstCofins,
+      aliquota_cofins: aliquotaCofins,
+      cst_ipi: cstIpi,
+      aliquota_ipi: aliquotaIpi,
+      ex_tipi: exTipi,
+      cenq,
+      ibs_cbs_cst: ibsCbsCst,
+      cclass_trib: cclassTrib,
+      aliquota_ibs_uf: aliquotaIbsUf,
+      aliquota_ibs_municipio: aliquotaIbsMunicipio,
+      aliquota_cbs: aliquotaCbs,
+      cbenef,
+      vtottrib,
+      observacao: "Campos recuperados do texto fiscal estruturado retornado pela pesquisa web."
+    },
+    justificativa_curta: "NCM e campos fiscais recuperados do texto fiscal estruturado retornado pela pesquisa web.",
+    status: "CLASSIFICADO",
+    fontes: [{ type: "web_text_recovered", code: ncm, description, url: "", confidence: 0.9 }],
+    avisos: ["A pesquisa retornou texto fiscal em vez de JSON; os campos rotulados foram recuperados automaticamente."]
+  };
+}
+
 function collectOpenAiWebEvidence(payload) {
   const items = [];
   const seen = new Set();
@@ -3094,6 +3221,7 @@ async function callOpenAiNcm(context) {
       }
     ],
     max_output_tokens: OPENAI_NCM_MAX_OUTPUT_TOKENS,
+    parallel_tool_calls: false,
     text: {
       format: {
         type: "json_schema",
@@ -3139,15 +3267,22 @@ async function callOpenAiNcm(context) {
       throw error;
     }
     const outputText = extractOpenAiOutputText(payload);
-    const parsed = parseOpenAiJsonOutput(outputText);
+    const webEvidence = collectOpenAiWebEvidence(payload);
+    const parsedJson = parseOpenAiJsonOutput(outputText);
+    const recoveredText = outputText || webEvidence.map((item) => `${item.title || ""}\n${item.snippet || ""}`).join("\n");
+    const parsed = parsedJson || parseOpenAiFiscalText(recoveredText, context);
+    const incompleteReason = payload.status === "incomplete" ? payload.incomplete_details?.reason : "";
     return {
       response_id: payload.id || null,
       model: payload.model || OPENAI_NCM_MODEL,
       usage: payload.usage || null,
       raw_text: outputText,
       parsed,
-      parse_error: parsed ? null : "O classificador automatico respondeu sem JSON valido para o NCM.",
-      web_evidence: collectOpenAiWebEvidence(payload)
+      response_format: parsedJson ? "json_schema" : parsed ? "text_recovered" : "unavailable",
+      parse_error: parsed ? null : incompleteReason
+        ? `Resposta incompleta do classificador: ${incompleteReason}.`
+        : "O classificador automatico respondeu sem JSON valido para o NCM.",
+      web_evidence: webEvidence
     };
   } finally {
     clearTimeout(timeout);
@@ -4179,8 +4314,10 @@ async function checkReviewTableAiNcm(options = {}, actor = "contador") {
   }
   const paidQuantity = billing?.enabled ? Math.max(0, Number(billing.quantity || 0)) : aiJobs.length;
   const billableRows = billing?.enabled ? aiJobs.slice(0, paidQuantity) : aiJobs;
-  const concurrency = billableRows.length ? OPENAI_NCM_CONCURRENCY : 0;
-  const progressMessage = "Auto classificacao em andamento (1 produto por vez). Nao feche o navegador.";
+  const concurrency = billableRows.length ? Math.min(OPENAI_NCM_CONCURRENCY, billableRows.length) : 0;
+  const progressMessage = concurrency > 1
+    ? `Auto classificacao em andamento (${concurrency} produtos por vez). Nao feche o navegador.`
+    : "Auto classificacao em andamento. Nao feche o navegador.";
   let processed = 0;
   let failed = 0;
   const runningItems = new Map();
