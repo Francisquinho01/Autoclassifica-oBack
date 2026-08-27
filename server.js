@@ -43,11 +43,9 @@ const OPENAI_NCM_APPLY_THRESHOLD = Math.min(Math.max(Number(process.env.OPENAI_N
 const OPENAI_NCM_TIMEOUT_MS = Math.min(Math.max(Number(process.env.OPENAI_NCM_TIMEOUT_MS || 30000), 8000), 90000);
 const OPENAI_NCM_MAX_OUTPUT_TOKENS = Math.min(Math.max(Number(process.env.OPENAI_NCM_MAX_OUTPUT_TOKENS || 1800), 800), 3500);
 const OPENAI_NCM_WEB_SEARCH_ENABLED = String(process.env.OPENAI_NCM_WEB_SEARCH_ENABLED || "true").toLowerCase() !== "false";
-const OPENAI_NCM_CONCURRENCY_INPUT = Number(process.env.OPENAI_NCM_CONCURRENCY || 10);
-const OPENAI_NCM_CONCURRENCY = Math.min(
-  Math.max(Number.isFinite(OPENAI_NCM_CONCURRENCY_INPUT) ? Math.round(OPENAI_NCM_CONCURRENCY_INPUT) : 10, 1),
-  10
-);
+// O classificador processa um produto por vez para evitar concorrencia entre
+// pesquisas web, respostas e atualizacoes fiscais da mesma lista.
+const OPENAI_NCM_CONCURRENCY = 1;
 const MERCADO_PAGO_ACCESS_TOKEN = process.env.MERCADO_PAGO_ACCESS_TOKEN || "";
 const AI_BILLING_PRICE_CENTS = Math.min(Math.max(Number(process.env.AI_BILLING_PRICE_CENTS || 15), 1), 100000);
 const AI_BILLING_DEFAULT_ENABLED = true;
@@ -2275,9 +2273,7 @@ function clampProgressPercent(value) {
 }
 
 function normalizeAiNcmConcurrency(value = OPENAI_NCM_CONCURRENCY) {
-  const number = Number(value);
-  if (!Number.isFinite(number)) return OPENAI_NCM_CONCURRENCY;
-  return Math.min(8, Math.max(1, Math.round(number)));
+  return OPENAI_NCM_CONCURRENCY;
 }
 
 function buildAiBillingProgress(progress = {}, defaults = {}) {
@@ -4183,12 +4179,8 @@ async function checkReviewTableAiNcm(options = {}, actor = "contador") {
   }
   const paidQuantity = billing?.enabled ? Math.max(0, Number(billing.quantity || 0)) : aiJobs.length;
   const billableRows = billing?.enabled ? aiJobs.slice(0, paidQuantity) : aiJobs;
-  const concurrency = billableRows.length
-    ? Math.min(normalizeAiNcmConcurrency(options.concurrency ?? OPENAI_NCM_CONCURRENCY), billableRows.length)
-    : 0;
-  const progressMessage = concurrency > 1
-    ? `Auto classificacao em andamento (${concurrency} produtos por vez). Nao feche o navegador.`
-    : "Auto classificacao em andamento. Nao feche o navegador.";
+  const concurrency = billableRows.length ? OPENAI_NCM_CONCURRENCY : 0;
+  const progressMessage = "Auto classificacao em andamento (1 produto por vez). Nao feche o navegador.";
   let processed = 0;
   let failed = 0;
   const runningItems = new Map();
