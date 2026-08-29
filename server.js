@@ -2858,7 +2858,7 @@ function aiNcmInstructions() {
     "Voce e o classificador fiscal web-first da Aikkie para produtos vendidos no Brasil.",
     "Cada requisicao e independente. Use request_id e sku recebidos no contexto e devolva exatamente os mesmos valores; nao use memoria, conversa anterior, produto anterior ou inferencia de outro item.",
     "Pesquise na web usando search_queries.fiscal_full e consultas equivalentes ao estilo: '<descricao do produto> ncm UF <UF> SKU EAN GTIN Descricao NCM CEST Unidade Origem CFOP CST ICMS CSOSN aliquota ICMS ICMS-ST FCP PIS COFINS IPI EX TIPI cEnq IBS CBS cClassTrib cBenef vTotTrib'.",
-    "Use o resultado web mais direto encontrado, priorizando o bloco 'Visao geral criada por IA' do Google quando aparecer, e extraia os codigos/campos fiscais retornados para dados_fiscais.",
+    "A ferramenta de busca web nao acessa o widget 'Visao geral criada por IA' do Google (ele so existe renderizado por JavaScript na pagina do Google, fora do alcance de qualquer API de busca). Use o resultado web mais direto e estruturado encontrado (paginas de classificacao fiscal, tabelas NCM/CEST, portais contabeis) e extraia os codigos/campos fiscais retornados para dados_fiscais.",
     "Nao use candidatos locais, ocorrencias, regras antigas, memoria ou aprendizado para escolher o resultado; a pesquisa web desta requisicao define a resposta.",
     "Use a descricao recebida como verdade de entrada. Nao interrompa o fluxo e nao deixe pendente por descricao generica; pesquise e classifique pelo retorno web mais direto.",
     "Preencha todos os campos de dados_fiscais. Quando a web disser que nao possui CEST/cBenef/EX TIPI obrigatorio, use 'SEM CEST OBRIGATORIO', 'SEM CBENEF' ou string vazia conforme o campo.",
@@ -3236,7 +3236,7 @@ async function callOpenAiNcm(context) {
     request.tools = [
       {
         type: "web_search",
-        search_context_size: "low",
+        search_context_size: "medium",
         user_location: {
           type: "approximate",
           country: "BR",
@@ -3928,24 +3928,30 @@ function normalizeAiNcmResult(ai, context) {
   const invalidReturnedNcm = Boolean(rawNcmValue && rawNcmDigits.length !== 8);
   const confidence = clampConfidence(ai?.confianca_ncm ?? ai?.confidence);
   const productProfile = buildDefaultProductProfile(context, ai);
-  const acceptedNcm = Boolean(identity.ok && validNcm && !invalidReturnedNcm);
+  // A resposta da pesquisa web e tratada como fonte de verdade do produto: uma
+  // divergencia de request_id/sku (checagem administrativa de sanidade) vira aviso,
+  // nao bloqueia mais o NCM nem os campos fiscais que a IA efetivamente encontrou.
+  const acceptedNcm = Boolean(validNcm && !invalidReturnedNcm);
   const outputNcm = acceptedNcm ? cleanNcm : "00000000";
   const description = acceptedNcm
     ? fiscalText(fiscal.descricao) || official?.descricao || aiSourceDescription(ai?.fontes || ai?.sources || [], cleanNcm) || ""
     : "";
   const warnings = buildAiWarnings(ai, context, cleanNcm);
+  if (!identity.ok) {
+    // Divergencia de request_id/sku vira aviso visivel, mas nao derruba a resposta:
+    // o que a pesquisa web encontrou para este produto continua sendo aplicado.
+    warnings.unshift(...identity.errors);
+  }
   let status = aiStatus;
 
-  if (!identity.ok) {
-    status = "ERRO_VALIDACAO";
-    warnings.unshift(...identity.errors);
-  } else if (invalidReturnedNcm) {
+  if (invalidReturnedNcm) {
     status = "ERRO_VALIDACAO";
     const message = `NCM retornado invalido: ${ai?.ncm || fiscal.ncm || "vazio"}.`;
     warnings.unshift(message);
   } else if (acceptedNcm && !official) {
     const message = `NCM ${outputNcm} aplicado pela pesquisa web, mas nao localizado na base NCM oficial local.`;
     if (!warnings.some((warning) => normalizeText(warning) === normalizeText(message))) warnings.unshift(message);
+    if (!["ERRO_BASE_FISCAL", "ERRO_OPENAI", "ERRO_VALIDACAO"].includes(status)) status = "CLASSIFICADO";
   } else if (acceptedNcm && !["ERRO_BASE_FISCAL", "ERRO_OPENAI", "ERRO_VALIDACAO"].includes(status)) {
     status = "CLASSIFICADO";
   }
@@ -3958,6 +3964,11 @@ function normalizeAiNcmResult(ai, context) {
   const fieldSuggestions = buildFieldSuggestions(ai, context, outputNcm || "00000000", description, confidence);
   const fieldScores = buildFieldScores(ai, confidence);
   const safeToApply = Boolean(status === "CLASSIFICADO" && acceptedNcm);
+  // O NCM so e gravado quando reduz a 8 digitos validos; os demais campos fiscais
+  // (CEST, CFOP, CST/aliquotas, IBS/CBS...) sao gravados sempre que a chamada tiver
+  // de fato respondido (nao falhou na OpenAI) - a pesquisa web e tratada como a
+  // verdade do produto, sem exigir bater request_id/sku pra confiar no conteudo.
+  const fieldsEligibleToApply = Boolean(status !== "ERRO_OPENAI");
   const result = {
     request_id: context.request_id || "",
     sku: context.product?.sku || context.product?.codigo_produto || "",
@@ -3978,6 +3989,7 @@ function normalizeAiNcmResult(ai, context) {
     field_suggestions: fieldSuggestions,
     why: buildWhy(ai, context, outputNcm, acceptedNcm ? description : ""),
     eligible_to_apply: safeToApply,
+    fields_eligible_to_apply: fieldsEligibleToApply,
     validation: {
       status,
       request_id_expected: context.request_id || null,
@@ -4155,13 +4167,24 @@ function updateClassificationAiNcm(id, aiCheck, options = {}, actor = "contador"
   if (!previous) return null;
   const currentSuggestion = previous.sugestao || {};
   const shouldTryApply = options.apply_suggestion !== false && options.applySuggestion !== false;
-  const canApply = shouldTryApply && previous.status !== "approved" && aiCheck.result?.eligible_to_apply;
-  const fiscalPatch = canApply ? buildFiscalPatchFromNcm(previous, aiCheck.result.ncm, aiCheck.result) : previous;
-  const nextAiCheck = canApply ? { ...aiCheck, applied_fiscal: fiscalPatch } : aiCheck;
+  const notApproved = previous.status !== "approved";
+  // NCM so e sobrescrito quando reduz a 8 digitos validos (nao exige mais bater request_id/sku).
+  const canApplyNcm = Boolean(shouldTryApply && notApproved && aiCheck.result?.eligible_to_apply);
+  // Os demais campos fiscais (CEST, CFOP, CST/aliquotas ICMS-PIS-COFINS-IPI, IBS/CBS, cBenef, vTotTrib...)
+  // sao gravados sempre que a resposta for da requisicao certa e a chamada nao tiver falhado,
+  // mesmo quando o NCM ainda ficar pendente de revisao manual - antes eles eram descartados junto.
+  const canApplyFields = Boolean(shouldTryApply && notApproved && aiCheck.result?.fields_eligible_to_apply);
+  const ncmForPatch = canApplyNcm ? aiCheck.result.ncm : previous.ncm;
+  const fiscalPatch = canApplyFields ? buildFiscalPatchFromNcm(previous, ncmForPatch, aiCheck.result) : previous;
+  const nextAiCheck = canApplyFields
+    ? { ...aiCheck, applied_fiscal: fiscalPatch, applied_ncm: canApplyNcm }
+    : aiCheck;
   const nextSuggestion = { ...currentSuggestion, ai_ncm: nextAiCheck };
-  const confidence = canApply ? Math.max(Number(previous.confianca || 0), aiCheck.result.confidence) : previous.confianca;
-  const observation = canApply
-    ? `NCM e fiscal aplicados pelo classificador automatico: ${aiCheck.result.ncm} - ${aiCheck.result.descricao || aiCheck.result.reason}`
+  const confidence = canApplyFields ? Math.max(Number(previous.confianca || 0), aiCheck.result.confidence) : previous.confianca;
+  const observation = canApplyFields
+    ? canApplyNcm
+      ? `NCM e fiscal aplicados pelo classificador automatico: ${aiCheck.result.ncm} - ${aiCheck.result.descricao || aiCheck.result.reason}`
+      : `Campos fiscais aplicados pelo classificador automatico (NCM mantido para revisao manual): ${aiCheck.result?.reason || "confira o NCM antes de aprovar."}`
     : `${previous.observacao || ""}${previous.observacao ? " " : ""}Auto classificacao: ${aiCheck.result?.reason || "revisar manualmente."}`.trim();
 
   db.prepare(
@@ -4210,7 +4233,7 @@ function updateClassificationAiNcm(id, aiCheck, options = {}, actor = "contador"
     now(),
     id
   );
-  if (canApply && fiscalPatch.unidade && fiscalPatch.unidade !== previous.unidade) {
+  if (canApplyFields && fiscalPatch.unidade && fiscalPatch.unidade !== previous.unidade) {
     db.prepare("UPDATE products SET unidade = ? WHERE id = ?").run(fiscalPatch.unidade, previous.product_id);
   }
 
