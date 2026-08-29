@@ -47,9 +47,10 @@ const OPENAI_NCM_MAX_OUTPUT_TOKENS = Math.min(
   5000
 );
 const OPENAI_NCM_WEB_SEARCH_ENABLED = String(process.env.OPENAI_NCM_WEB_SEARCH_ENABLED || "true").toLowerCase() !== "false";
-// O classificador processa ate cinco produtos por vez para equilibrar
-// velocidade, limite de saida e estabilidade das pesquisas web.
-const OPENAI_NCM_CONCURRENCY = 5;
+// Quantos produtos o classificador processa em paralelo. Cada chamada com busca web
+// gasta bem mais tokens por minuto (TPM) do que uma chamada simples; o padrao fica
+// em 1 produto por vez para reduzir risco de limite da OpenAI e resposta incompleta.
+const OPENAI_NCM_CONCURRENCY = Math.min(Math.max(Number(process.env.OPENAI_NCM_CONCURRENCY || 1), 1), 10);
 const MERCADO_PAGO_ACCESS_TOKEN = process.env.MERCADO_PAGO_ACCESS_TOKEN || "";
 const AI_BILLING_PRICE_CENTS = Math.min(Math.max(Number(process.env.AI_BILLING_PRICE_CENTS || 15), 1), 100000);
 const AI_BILLING_DEFAULT_ENABLED = true;
@@ -3202,7 +3203,19 @@ function buildOpenAiNcmInput(context = {}) {
   };
 }
 
-async function callOpenAiNcm(context) {
+function parseRetryAfterMs(message = "") {
+  const match = String(message || "").match(/try again in\s*([\d.]+)\s*(ms|s)\b/i);
+  if (!match) return null;
+  const value = Number(match[1]);
+  if (!Number.isFinite(value)) return null;
+  return match[2].toLowerCase() === "s" ? value * 1000 : value;
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function callOpenAiNcm(context, attempt = 1) {
   assertOpenAiConfigured();
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), OPENAI_NCM_TIMEOUT_MS);
@@ -3262,8 +3275,19 @@ async function callOpenAiNcm(context) {
     const payload = contentType.includes("application/json") ? await response.json() : { error: await response.text() };
     if (!response.ok) {
       const message = payload?.error?.message || payload?.error || `Classificador HTTP ${response.status}`;
-      const error = new Error(`Falha no classificador automatico: ${message}`);
-      error.status = response.status === 401 ? 422 : 502;
+      const maxAttempts = 3;
+      if (response.status === 429 && attempt < maxAttempts) {
+        clearTimeout(timeout);
+        const waitMs = Math.min(Math.max(parseRetryAfterMs(message) || 1000 * attempt, 300), 8000);
+        await sleep(waitMs);
+        return callOpenAiNcm(context, attempt + 1);
+      }
+      const error = new Error(
+        response.status === 429
+          ? `Falha no classificador automatico: limite de uso da OpenAI atingido (tokens por minuto). ${message}`
+          : `Falha no classificador automatico: ${message}`
+      );
+      error.status = response.status === 401 ? 422 : response.status === 429 ? 429 : 502;
       throw error;
     }
     const outputText = extractOpenAiOutputText(payload);
