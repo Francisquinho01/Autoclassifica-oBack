@@ -6,7 +6,8 @@
   "scripts": {
     "dev": "node --watch server.js",
     "start": "node server.js",
-    "check": "node --check server.js"
+    "check": "node --check server.js",
+    "test": "node --test"
   },
   "dependencies": {
     "xlsx": "^0.18.5"

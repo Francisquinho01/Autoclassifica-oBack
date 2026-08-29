@@ -4,6 +4,13 @@ import { randomUUID } from "node:crypto";
 import { extname, join, normalize, resolve } from "node:path";
 import { createReadStream, existsSync, mkdirSync, readFileSync, statSync } from "node:fs";
 import { TextDecoder } from "node:util";
+import {
+  decideNcmValidity,
+  decideNcmStatusAndWarnings,
+  decideSafeToApplyNcm,
+  decideFieldsEligibleToApply,
+  decideIcmsRegimeFields
+} from "./fiscal/ncmDecision.js";
 
 function loadLocalEnv() {
   const envPath = resolve(".env");
@@ -3978,58 +3985,37 @@ function normalizeAiNcmResult(ai, context) {
   const identity = validateAiResponseIdentity(ai, context);
   const fiscal = aiFiscalData(ai);
   const rawNcmValue = ai?.ncm || fiscal.ncm;
-  const rawNcmDigits = String(rawNcmValue || "").replace(/\D/g, "");
-  const aiNcm = rawNcmDigits.length === 8 ? rawNcmDigits : "";
-  const aiReturnedNcm = aiNcm && aiNcm !== "00000000" ? aiNcm : "";
+  // Decisao pura (sem banco de dados), extraida pra AutoBack/fiscal/ncmDecision.js
+  // e coberta por testes em AutoBack/test/ncmDecision.test.js - nao duplicar essa
+  // logica aqui de novo, e atualizar os testes junto se ela precisar mudar.
+  const { aiReturnedNcm, invalidReturnedNcm, acceptedNcm } = decideNcmValidity(rawNcmValue);
   const cleanNcm = aiReturnedNcm;
   const official = cleanNcm ? getOfficialNcmRow(cleanNcm) : null;
-  const validNcm = Boolean(cleanNcm && cleanNcm.length === 8 && cleanNcm !== "00000000");
   const fromAiSources = aiSourcesSupportNcm(ai?.fontes || ai?.sources || [], cleanNcm);
   const fromWebEvidence = Boolean(webEvidenceSupportsNcm(context.web_evidence, cleanNcm) || fromAiSources);
-  const invalidReturnedNcm = Boolean(rawNcmValue && rawNcmDigits.length !== 8);
   const confidence = clampConfidence(ai?.confianca_ncm ?? ai?.confidence);
   const productProfile = buildDefaultProductProfile(context, ai);
-  // A resposta da pesquisa web e tratada como fonte de verdade do produto: uma
-  // divergencia de request_id/sku (checagem administrativa de sanidade) vira aviso,
-  // nao bloqueia mais o NCM nem os campos fiscais que a IA efetivamente encontrou.
-  const acceptedNcm = Boolean(validNcm && !invalidReturnedNcm);
   const outputNcm = acceptedNcm ? cleanNcm : "00000000";
   const description = acceptedNcm
     ? fiscalText(fiscal.descricao) || official?.descricao || aiSourceDescription(ai?.fontes || ai?.sources || [], cleanNcm) || ""
     : "";
-  const warnings = buildAiWarnings(ai, context, cleanNcm);
-  if (!identity.ok) {
-    // Divergencia de request_id/sku vira aviso visivel, mas nao derruba a resposta:
-    // o que a pesquisa web encontrou para este produto continua sendo aplicado.
-    warnings.unshift(...identity.errors);
-  }
-  let status = aiStatus;
-
-  if (invalidReturnedNcm) {
-    status = "ERRO_VALIDACAO";
-    const message = `NCM retornado invalido: ${ai?.ncm || fiscal.ncm || "vazio"}.`;
-    warnings.unshift(message);
-  } else if (acceptedNcm && !official) {
-    const message = `NCM ${outputNcm} aplicado pela pesquisa web, mas nao localizado na base NCM oficial local.`;
-    if (!warnings.some((warning) => normalizeText(warning) === normalizeText(message))) warnings.unshift(message);
-    if (!["ERRO_BASE_FISCAL", "ERRO_OPENAI", "ERRO_VALIDACAO"].includes(status)) status = "CLASSIFICADO";
-  } else if (acceptedNcm && !["ERRO_BASE_FISCAL", "ERRO_OPENAI", "ERRO_VALIDACAO"].includes(status)) {
-    status = "CLASSIFICADO";
-  }
-
-  if (!acceptedNcm && aiReturnedNcm && !invalidReturnedNcm) {
-    const message = `NCM ${aiReturnedNcm} nao foi aplicado por falha de validacao do contexto.`;
-    if (!warnings.some((warning) => normalizeText(warning) === normalizeText(message))) warnings.unshift(message);
-  }
+  const { status, warnings } = decideNcmStatusAndWarnings({
+    aiStatus,
+    identityOk: identity.ok,
+    identityErrors: identity.errors,
+    invalidReturnedNcm,
+    rawNcmValue: ai?.ncm || fiscal.ncm,
+    acceptedNcm,
+    outputNcm,
+    officialExists: Boolean(official),
+    aiReturnedNcm,
+    baseWarnings: buildAiWarnings(ai, context, cleanNcm)
+  });
 
   const fieldSuggestions = buildFieldSuggestions(ai, context, outputNcm || "00000000", description, confidence);
   const fieldScores = buildFieldScores(ai, confidence);
-  const safeToApply = Boolean(status === "CLASSIFICADO" && acceptedNcm);
-  // O NCM so e gravado quando reduz a 8 digitos validos; os demais campos fiscais
-  // (CEST, CFOP, CST/aliquotas, IBS/CBS...) sao gravados sempre que a chamada tiver
-  // de fato respondido (nao falhou na OpenAI) - a pesquisa web e tratada como a
-  // verdade do produto, sem exigir bater request_id/sku pra confiar no conteudo.
-  const fieldsEligibleToApply = Boolean(status !== "ERRO_OPENAI");
+  const safeToApply = decideSafeToApplyNcm(status, acceptedNcm);
+  const fieldsEligibleToApply = decideFieldsEligibleToApply(status);
   const result = {
     request_id: context.request_id || "",
     sku: context.product?.sku || context.product?.codigo_produto || "",
@@ -4187,9 +4173,36 @@ function buildFiscalPatchFromNcm(previous, ncm, aiResult = null) {
   const finalCfopInterestadual = asCleanString(suggested.cfop_interstate, cfops.interestadual);
   const finalPis = asCleanString(suggested.cst_pis);
   const finalCofins = asCleanString(suggested.cst_cofins);
+  // Existe uma tabela curada de regras PIS/COFINS por NCM (regras_pis_cofins_por_ncm)
+  // que estava pronta mas nunca era usada. Quando o NCM bate exatamente com uma
+  // regra cadastrada ali (monofasica, aliquota zero etc.), ela e mais confiavel
+  // que a IA lembrar isso de novo a cada chamada, entao tem prioridade. Sem
+  // regra cadastrada pra este NCM, continua vindo da pesquisa web como antes.
+  const localPisCofins = getPisCofins(ncm, { allowFallback: false });
+  const pisCofinsFinal = localPisCofins
+    ? {
+        cst_pis: getPisCofinsCst(localPisCofins),
+        aliquota_pis: numberOrFallback(localPisCofins.aliquota_pis, null),
+        cst_cofins: getPisCofinsCst(localPisCofins),
+        aliquota_cofins: numberOrFallback(localPisCofins.aliquota_cofins, null)
+      }
+    : {
+        cst_pis: finalPis,
+        aliquota_pis: numberOrFallback(suggested.aliquota_pis, null),
+        cst_cofins: finalCofins,
+        aliquota_cofins: numberOrFallback(suggested.aliquota_cofins, null)
+      };
   const suggestedCsosn = asCleanString(suggested.csosn);
   const suggestedCstIcms = asCleanString(suggested.cst_icms);
-  const finalCsosn = suggestedCsosn || null;
+  // CSOSN e CST ICMS sao mutuamente exclusivos no layout da NF-e: qual dos dois
+  // e gravado depende do regime tributario da empresa (Simples Nacional usa
+  // CSOSN, os demais regimes usam CST ICMS) - regra fixa, decidida em codigo
+  // em vez de depender da IA lembrar disso a cada produto. Ver AutoBack/fiscal/ncmDecision.js.
+  const icmsRegimeFields = decideIcmsRegimeFields({
+    regimeTributario: company?.regime_tributario,
+    suggestedCstIcms,
+    suggestedCsosn
+  });
 
   return {
     unidade: asCleanString(suggested.unidade, previous.unidade || null),
@@ -4199,15 +4212,15 @@ function buildFiscalPatchFromNcm(previous, ncm, aiResult = null) {
     cest: finalCest,
     cfop_interno: finalCfopInterno,
     cfop_interestadual: finalCfopInterestadual,
-    cst_icms: suggestedCstIcms || null,
+    cst_icms: icmsRegimeFields.cst_icms,
     aliquota_icms: numberOrFallback(suggested.aliquota_icms, null),
     icms_st: finalIcmsSt,
-    csosn: finalCsosn,
+    csosn: icmsRegimeFields.csosn,
     origem: asCleanString(suggested.origem),
-    cst_pis: finalPis,
-    aliquota_pis: numberOrFallback(suggested.aliquota_pis, null),
-    cst_cofins: finalCofins,
-    aliquota_cofins: numberOrFallback(suggested.aliquota_cofins, null),
+    cst_pis: pisCofinsFinal.cst_pis,
+    aliquota_pis: pisCofinsFinal.aliquota_pis,
+    cst_cofins: pisCofinsFinal.cst_cofins,
+    aliquota_cofins: pisCofinsFinal.aliquota_cofins,
     aliquota_fcp: numberOrFallback(suggested.aliquota_fcp, null),
     ibs_cbs_cst: ibsCbsPatch.ibs_cbs_cst,
     cclass_trib: ibsCbsPatch.cclass_trib,
