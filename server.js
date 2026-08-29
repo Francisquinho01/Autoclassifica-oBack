@@ -40,12 +40,28 @@ const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
 const OPENAI_NCM_MODEL = process.env.OPENAI_NCM_MODEL || "gpt-5-mini";
 const OPENAI_NCM_API_URL = process.env.OPENAI_NCM_API_URL || "https://api.openai.com/v1/responses";
 const OPENAI_NCM_APPLY_THRESHOLD = Math.min(Math.max(Number(process.env.OPENAI_NCM_APPLY_THRESHOLD || 0.9), 0.9), 0.99);
-const OPENAI_NCM_TIMEOUT_MS = Math.min(Math.max(Number(process.env.OPENAI_NCM_TIMEOUT_MS || 30000), 8000), 90000);
+// Com search_context_size "medium" a OpenAI le mais paginas antes de responder, o que
+// demora mais que uma busca rasa. Como agora processamos 1 produto por vez (sem varias
+// chamadas disputando o mesmo minuto), da pra esperar mais por chamada sem prejuizo:
+// o timeout padrao subiu de 30s para 60s (configuravel/limitavel via .env).
+const OPENAI_NCM_TIMEOUT_MS = Math.min(Math.max(Number(process.env.OPENAI_NCM_TIMEOUT_MS || 60000), 8000), 120000);
 const OPENAI_NCM_MAX_OUTPUT_TOKENS_INPUT = Number(process.env.OPENAI_NCM_MAX_OUTPUT_TOKENS || 3500);
 const OPENAI_NCM_MAX_OUTPUT_TOKENS = Math.min(
   Math.max(Number.isFinite(OPENAI_NCM_MAX_OUTPUT_TOKENS_INPUT) ? OPENAI_NCM_MAX_OUTPUT_TOKENS_INPUT : 3500, 3500),
   5000
 );
+// Modelos gpt-5.x "pensam" antes de responder e esses tokens de raciocinio sao
+// cobrados como tokens de saida - sem definir isso, a API usa "medium" por padrao,
+// que e o maior gasto escondido por chamada (bem mais caro que o JSON final em si).
+// "low" e o nivel recomendado pela propria OpenAI pra tarefas com uso de ferramenta
+// (nosso caso: web_search) que nao exigem raciocinio em varias etapas - mantem a
+// pesquisa web e o schema completo, so reduz o "pensar" excessivo por tras.
+const OPENAI_NCM_REASONING_ALLOWED = ["none", "minimal", "low", "medium", "high", "xhigh", "max"];
+const OPENAI_NCM_REASONING_EFFORT = OPENAI_NCM_REASONING_ALLOWED.includes(
+  String(process.env.OPENAI_NCM_REASONING_EFFORT || "low").toLowerCase()
+)
+  ? String(process.env.OPENAI_NCM_REASONING_EFFORT || "low").toLowerCase()
+  : "low";
 const OPENAI_NCM_WEB_SEARCH_ENABLED = String(process.env.OPENAI_NCM_WEB_SEARCH_ENABLED || "true").toLowerCase() !== "false";
 // Quantos produtos o classificador processa em paralelo. Cada chamada com busca web
 // gasta bem mais tokens por minuto (TPM) do que uma chamada simples; o padrao fica
@@ -2020,6 +2036,7 @@ function aiNcmConfig() {
     model: OPENAI_NCM_MODEL,
     apply_threshold: OPENAI_NCM_APPLY_THRESHOLD,
     max_output_tokens: OPENAI_NCM_MAX_OUTPUT_TOKENS,
+    reasoning_effort: OPENAI_NCM_REASONING_EFFORT,
     concurrency: OPENAI_NCM_CONCURRENCY,
     api_url: OPENAI_NCM_API_URL.replace(/\/v1\/responses.*/, "/v1/responses"),
     web_search_enabled: OPENAI_NCM_WEB_SEARCH_ENABLED,
@@ -3235,6 +3252,7 @@ async function callOpenAiNcm(context, attempt = 1) {
     ],
     max_output_tokens: OPENAI_NCM_MAX_OUTPUT_TOKENS,
     parallel_tool_calls: false,
+    reasoning: { effort: OPENAI_NCM_REASONING_EFFORT },
     text: {
       format: {
         type: "json_schema",
@@ -3262,15 +3280,34 @@ async function callOpenAiNcm(context, attempt = 1) {
   }
 
   try {
-    const response = await fetch(OPENAI_NCM_API_URL, {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${OPENAI_API_KEY}`,
-        "Content-Type": "application/json"
-      },
-      body: JSON.stringify(request),
-      signal: controller.signal
-    });
+    let response;
+    try {
+      response = await fetch(OPENAI_NCM_API_URL, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${OPENAI_API_KEY}`,
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify(request),
+        signal: controller.signal
+      });
+    } catch (fetchError) {
+      clearTimeout(timeout);
+      const isAbort = fetchError?.name === "AbortError" || /aborted/i.test(fetchError?.message || "");
+      const maxAttempts = 3;
+      if (isAbort && attempt < maxAttempts) {
+        // Tempo esgotado (comum com busca web mais profunda). Tenta de novo do zero
+        // em vez de devolver erro na primeira demora, antes de desistir de verdade.
+        return callOpenAiNcm(context, attempt + 1);
+      }
+      const error = new Error(
+        isAbort
+          ? "Falha no classificador automatico: tempo limite de resposta da OpenAI excedido (a pesquisa web demorou mais que o esperado)."
+          : `Falha no classificador automatico: ${fetchError?.message || fetchError}`
+      );
+      error.status = 502;
+      throw error;
+    }
     const contentType = response.headers.get("content-type") || "";
     const payload = contentType.includes("application/json") ? await response.json() : { error: await response.text() };
     if (!response.ok) {
