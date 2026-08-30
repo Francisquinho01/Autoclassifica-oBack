@@ -2886,13 +2886,14 @@ function aiNcmInstructions() {
     "A ferramenta de busca web nao acessa o widget 'Visao geral criada por IA' do Google (ele so existe renderizado por JavaScript na pagina do Google, fora do alcance de qualquer API de busca). Use o resultado web mais direto e estruturado encontrado (paginas de classificacao fiscal, tabelas NCM/CEST, portais contabeis) e extraia os codigos/campos fiscais retornados para dados_fiscais.",
     "Nao use candidatos locais, ocorrencias, regras antigas, memoria ou aprendizado para escolher o resultado; a pesquisa web desta requisicao define a resposta.",
     "Use a descricao recebida como verdade de entrada. Nao interrompa o fluxo e nao deixe pendente por descricao generica; pesquise e classifique pelo retorno web mais direto.",
-    "Preencha todos os campos de dados_fiscais. Quando a web disser que nao possui CEST/cBenef/EX TIPI obrigatorio, use 'SEM CEST OBRIGATORIO', 'SEM CBENEF' ou string vazia conforme o campo.",
+    "IMPORTANTE: NUNCA deixe um campo de dados_fiscais vazio so porque a pesquisa web nao trouxe uma pagina citando esse produto especifico. Quando a pesquisa nao confirmar um valor exato, aplique a regra fiscal padrao brasileira que melhor se encaixa na empresa e no produto e preencha um valor estimado mesmo assim - so deixe o campo vazio quando nao existir NENHUMA regra padrao aplicavel (ex: cBenef de incentivo estadual especifico que voce nao tem como saber, ou vTotTrib sem nenhuma base de calculo).",
+    "Regras padrao a aplicar quando a pesquisa nao confirmar um numero especifico: (1) CSOSN/CST ICMS: se company.regime_tributario for Simples Nacional use CSOSN - '102' para revenda tributada normalmente sem substituicao tributaria, '500' quando o produto tiver CEST/ICMS-ST identificado, '900' apenas se nenhum dos dois se aplicar claramente; se NAO for Simples Nacional use CST ICMS - '00' tributada integralmente, '60' quando ja houver ICMS-ST cobrado antes, '40'/'41' apenas se o produto for claramente isento/nao tributado. (2) PIS/COFINS: se nao achar aliquota monofasica especifica para o NCM, use o padrao nao-cumulativo CST '01' com aliquota_pis 1.65 e aliquota_cofins 7.6 (regra geral da maioria dos regimes de apuracao), a menos que a pesquisa indique regime cumulativo (Lucro Presumido, CST '01', aliquota_pis 0.65, aliquota_cofins 3.0) ou tributacao monofasica conhecida para a categoria do produto (bebidas, combustiveis, cosmeticos, farmacos, autopecas, pneus - nesses casos pesquise a aliquota monofasica antes de usar o padrao). (3) IBS/CBS: aplique a regra de transicao da LC 214/2025 - ibs_cbs_cst '000' (tributacao integral padrao) e cclass_trib '000001' quando nao identificar um regime diferenciado, reduzido ou isento para o NCM/produto; nao deixe esses dois campos vazios. (4) origem: use '0' (nacional) quando nada na descricao ou evidencia indicar produto importado. Sempre que preencher um campo por regra padrao (sem uma fonte web especifica confirmando o numero exato para este produto), acrescente uma frase curta em dados_fiscais.observacao e em avisos dizendo que aquele campo foi estimado por regra fiscal geral e precisa de revisao manual antes de aprovar - isso e diferente de inventar: e aplicar a regra oficial conhecida para o cenario mais provavel do produto, sinalizando quando nao ha confirmacao especifica.",
+    "Os unicos campos que podem legitimamente ficar com string vazia sao aqueles sem nenhuma regra padrao possivel: cBenef (codigo de beneficio estadual especifico que exige fonte confirmando o programa), EX TIPI (excecao especifica da tabela TIPI que exige a fonte oficial) e vTotTrib (valor calculado que exige base de calculo real do produto). Para CEST, quando a pesquisa e as regras gerais do segmento nao indicarem CEST obrigatorio, use 'SEM CEST OBRIGATORIO' em vez de deixar vazio ou 'incerto'.",
     "Nao invente EAN/GTIN. Se a fonte mostrar EAN generico, exemplo, 7890000000000, 0000000000000 ou placeholder, retorne ean_gtin vazio.",
     "Para CFOP, use operation.cfop_interno_default e operation.cfop_interestadual_default quando a busca nao trouxer valor melhor.",
     "Para UF, considere tax_scope.uf como UF fiscal da pesquisa, principalmente para ICMS, ICMS-ST, FCP, CEST e cBenef.",
     "Para NCM, retorne sempre 8 digitos sem ponto em ncm e dados_fiscais.ncm. Para CEST, retorne 7 digitos sem ponto quando houver codigo.",
     "Para percentuais, retorne apenas o numero como texto, sem o simbolo %, usando ponto ou virgula decimal.",
-    "Se algum campo realmente nao aparecer em nenhuma evidencia, deixe string vazia e explique em dados_fiscais.observacao/avisos.",
     "A justificativa_curta deve ser curta, objetiva e baseada no que a busca retornou. Nada de resposta longa.",
     "Retorne apenas JSON no formato do schema."
   ].join(" ");
@@ -3621,7 +3622,7 @@ function buildFieldSuggestions(ai = {}, context = {}, code = "", description = "
       suggestion.cest_reason,
       cestRequired === "nao"
         ? "Pesquisa/evidencia nao indicou CEST obrigatorio especifico."
-        : "CEST depende da evidencia web, UF, segmento e mercadoria."
+        : "CEST estimado por regra do segmento/NCM quando a pesquisa web nao confirmou um codigo especifico; confirme antes de aprovar."
     ),
     cfop_internal: cfopInternal,
     cfop_interstate: cfopInterstate,
@@ -3647,7 +3648,7 @@ function buildFieldSuggestions(ai = {}, context = {}, code = "", description = "
     aliquota_pis: numberOrFallback(suggestion.aliquota_pis, null),
     pis_cofins_reason: asCleanString(
       suggestion.pis_cofins_reason,
-      "PIS/COFINS preenchido somente quando retornado pela pesquisa fiscal."
+      "PIS/COFINS por regime padrao (nao-cumulativo 1.65/7.6) quando a pesquisa nao confirmou aliquota monofasica especifica; confirme antes de aprovar."
     ),
     cst_cofins: asCleanString(suggestion.cst_cofins),
     aliquota_cofins: numberOrFallback(suggestion.aliquota_cofins, null),
@@ -3659,13 +3660,13 @@ function buildFieldSuggestions(ai = {}, context = {}, code = "", description = "
     aliquota_cbs: numberOrFallback(suggestion.aliquota_cbs, null),
     ibs_cbs_reason: asCleanString(
       suggestion.ibs_cbs_reason,
-      "IBS/CBS deve ser cruzado com NCM, LC 214/2025, reducoes, aliquota zero e cClassTrib vigente."
+      "IBS/CBS estimado pela regra de transicao padrao da LC 214/2025 quando a pesquisa nao confirmou um regime diferenciado para este NCM; confirme antes de aprovar."
     ),
     cst_ipi: asCleanString(suggestion.cst_ipi),
     ipi: asCleanString(suggestion.ipi),
     ipi_reason: asCleanString(
       suggestion.ipi_reason,
-      "IPI/EX TIPI preenchido somente quando retornado pela pesquisa fiscal."
+      "IPI por regra padrao do capitulo/NCM quando a pesquisa nao trouxe aliquota especifica; EX TIPI so e preenchido quando a fonte oficial confirma a excecao. Confirme antes de aprovar."
     ),
     ex_tipi: asCleanString(suggestion.ex_tipi),
     cenq: asCleanString(suggestion.cenq),
