@@ -4164,10 +4164,16 @@ function buildFiscalPatchFromNcm(previous, ncm, aiResult = null) {
   const ibsCbsPatch = resolveIbsCbsPatch(suggested);
   const suggestedCest = normalizeCestSuggestion(suggested.cest, suggested.cest_required);
   const noCestRequired = isNoCestSignal(suggestedCest, suggested.cest_required);
-  const finalCest = noCestRequired ? "SEM CEST OBRIGATORIO" : suggestedCest || null;
+  const aiCest = noCestRequired ? "SEM CEST OBRIGATORIO" : suggestedCest || null;
+  // NCM com match exato (8 digitos) na tabela oficial CEST x NCM (Convenio 142/18) e
+  // caso decidido: o produto esta sujeito a ST por definicao do convenio, entao o
+  // codigo oficial tem prioridade sobre o palpite da IA - mesmo padrao ja usado para
+  // PIS/COFINS (getPisCofins) e CSOSN/CST ICMS (decideIcmsRegimeFields).
+  const localCest = getCestLocal(ncm);
+  const finalCest = localCest ? localCest.codigo_cest : aiCest;
   const finalIcmsSt = normalizeSimNaoIncerto(
     suggested.icms_st,
-    noCestRequired ? "nao" : finalCest && finalCest !== "SEM CEST OBRIGATORIO" ? "sim" : "incerto"
+    localCest ? "sim" : noCestRequired ? "nao" : finalCest && finalCest !== "SEM CEST OBRIGATORIO" ? "sim" : "incerto"
   );
   const finalCfopInterno = asCleanString(suggested.cfop_internal, cfops.interno);
   const finalCfopInterestadual = asCleanString(suggested.cfop_interstate, cfops.interestadual);
@@ -4858,6 +4864,21 @@ function getPisCofinsCst(pisCofins = {}) {
   if (incidence.includes("monofasica")) return "04";
   if (incidence.includes("zero")) return "06";
   return "01";
+}
+
+// A tabela `cest` foi populada (Convenio ICMS 142/18, via CONFAZ/tabelasfiscais.com.br,
+// dados de 24/08/2026) com o cruzamento oficial CEST x NCM. Quando o NCM classificado
+// bate exatamente (8 digitos) com uma linha dessa tabela, o produto ESTA sujeito a
+// Substituicao Tributaria por definicao do convenio - isso e uma regra oficial, nao uma
+// estimativa, entao tem prioridade sobre o palpite da IA (mesmo racional ja aplicado em
+// getPisCofins/decideIcmsRegimeFields). Um match apenas por prefixo de 4 digitos e
+// ambiguo demais (varios CEST podem compartilhar o mesmo capitulo/posicao) pra decidir
+// sozinho, entao so o match exato de NCM completo e usado aqui; prefixos continuam
+// disponiveis para consulta manual em getFiscalTablesForNcm.
+function getCestLocal(ncm) {
+  const cleanNcm = String(ncm || "").replace(/\D/g, "");
+  if (!cleanNcm) return null;
+  return db.prepare("SELECT * FROM cest WHERE ncm = ? ORDER BY codigo_cest LIMIT 1").get(cleanNcm) || null;
 }
 
 function getIbptEstimate(ncm, company, price) {
