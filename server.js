@@ -1,4 +1,5 @@
 import { createServer } from "node:http";
+import { crc32 } from "node:zlib";
 import { DatabaseSync } from "node:sqlite";
 import { randomUUID } from "node:crypto";
 import { extname, join, normalize, resolve } from "node:path";
@@ -5507,6 +5508,81 @@ function buildCsvExport() {
   ].join("\r\n");
 }
 
+function dosDateTime(date = new Date()) {
+  const dosTime = ((date.getHours() & 0x1f) << 11) | ((date.getMinutes() & 0x3f) << 5) | ((Math.floor(date.getSeconds() / 2)) & 0x1f);
+  const dosDate = (((date.getFullYear() - 1980) & 0x7f) << 9) | (((date.getMonth() + 1) & 0xf) << 5) | (date.getDate() & 0x1f);
+  return { dosTime, dosDate };
+}
+
+// Escritor de ZIP minimo (sem compressao, metodo "store") usando so node:zlib.crc32 -
+// evita adicionar uma dependencia nova (archiver/jszip) so pra zipar 1-2 arquivos pequenos
+// no botao "baixar ZIP" do chatbot/exportacao. Formato PKZIP padrao, qualquer descompactador
+// (Windows, macOS, WinRAR, 7-Zip) abre normalmente.
+function buildZipBuffer(files = []) {
+  const { dosTime, dosDate } = dosDateTime();
+  const localChunks = [];
+  const centralChunks = [];
+  let offset = 0;
+
+  for (const file of files) {
+    const nameBuffer = Buffer.from(file.name, "utf8");
+    const data = file.data;
+    const checksum = crc32(data) >>> 0;
+
+    const localHeader = Buffer.alloc(30);
+    localHeader.writeUInt32LE(0x04034b50, 0);
+    localHeader.writeUInt16LE(20, 4);
+    localHeader.writeUInt16LE(0, 6);
+    localHeader.writeUInt16LE(0, 8);
+    localHeader.writeUInt16LE(dosTime, 10);
+    localHeader.writeUInt16LE(dosDate, 12);
+    localHeader.writeUInt32LE(checksum, 14);
+    localHeader.writeUInt32LE(data.length, 18);
+    localHeader.writeUInt32LE(data.length, 22);
+    localHeader.writeUInt16LE(nameBuffer.length, 26);
+    localHeader.writeUInt16LE(0, 28);
+
+    localChunks.push(localHeader, nameBuffer, data);
+
+    const centralHeader = Buffer.alloc(46);
+    centralHeader.writeUInt32LE(0x02014b50, 0);
+    centralHeader.writeUInt16LE(20, 4);
+    centralHeader.writeUInt16LE(20, 6);
+    centralHeader.writeUInt16LE(0, 8);
+    centralHeader.writeUInt16LE(0, 10);
+    centralHeader.writeUInt16LE(dosTime, 12);
+    centralHeader.writeUInt16LE(dosDate, 14);
+    centralHeader.writeUInt32LE(checksum, 16);
+    centralHeader.writeUInt32LE(data.length, 20);
+    centralHeader.writeUInt32LE(data.length, 24);
+    centralHeader.writeUInt16LE(nameBuffer.length, 28);
+    centralHeader.writeUInt16LE(0, 30);
+    centralHeader.writeUInt16LE(0, 32);
+    centralHeader.writeUInt16LE(0, 34);
+    centralHeader.writeUInt16LE(0, 36);
+    centralHeader.writeUInt32LE(0, 38);
+    centralHeader.writeUInt32LE(offset, 42);
+
+    centralChunks.push(centralHeader, nameBuffer);
+    offset += localHeader.length + nameBuffer.length + data.length;
+  }
+
+  const centralDirectory = Buffer.concat(centralChunks);
+  const centralDirectoryOffset = offset;
+
+  const eocd = Buffer.alloc(22);
+  eocd.writeUInt32LE(0x06054b50, 0);
+  eocd.writeUInt16LE(0, 4);
+  eocd.writeUInt16LE(0, 6);
+  eocd.writeUInt16LE(files.length, 8);
+  eocd.writeUInt16LE(files.length, 10);
+  eocd.writeUInt32LE(centralDirectory.length, 12);
+  eocd.writeUInt32LE(centralDirectoryOffset, 16);
+  eocd.writeUInt16LE(0, 20);
+
+  return Buffer.concat([...localChunks, centralDirectory, eocd]);
+}
+
 async function buildXlsxExport() {
   let XLSX;
   try {
@@ -5883,6 +5959,14 @@ async function handleRequest(req, res) {
       "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
       exportFilename("xlsx")
     );
+  }
+
+  if (req.method === "GET" && path === "/api/export/classifications.zip") {
+    assertAiProcessingUnlocked();
+    const xlsxBuffer = await buildXlsxExport();
+    const xlsxName = exportFilename("xlsx");
+    const zipBuffer = buildZipBuffer([{ name: xlsxName, data: xlsxBuffer }]);
+    return sendBuffer(res, 200, zipBuffer, "application/zip", exportFilename("zip"));
   }
 
   if (req.method === "GET" && !path.startsWith("/api/") && tryServeFront(url, res)) {
