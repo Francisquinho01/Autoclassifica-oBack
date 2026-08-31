@@ -486,6 +486,7 @@ function setupDatabase() {
 
     CREATE TABLE IF NOT EXISTS import_batches (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
+      session_id TEXT,
       filename TEXT,
       source_type TEXT NOT NULL,
       operation_type TEXT NOT NULL DEFAULT 'venda',
@@ -744,6 +745,7 @@ function setupDatabase() {
   `);
 
   ensureTableColumns("import_batches", [
+    { name: "session_id", type: "TEXT" },
     { name: "uf", type: "TEXT NOT NULL DEFAULT 'SP'" }
   ]);
   ensureTableColumns("classifications", [
@@ -1055,6 +1057,15 @@ function normalizeUf(value, fallback = "SP") {
     .slice(0, 2);
   if (BRAZIL_UFS.has(fallbackClean)) return fallbackClean;
   return fallback === "" ? "" : "SP";
+}
+
+function normalizeSessionId(value = "") {
+  const clean = String(value ?? "").trim().slice(0, 120);
+  return /^[A-Za-z0-9][A-Za-z0-9_.:-]{5,119}$/.test(clean) ? clean : "";
+}
+
+function createAttendanceSessionId() {
+  return `att-${randomUUID()}`;
 }
 
 function extractSearchCode(value = "") {
@@ -2075,6 +2086,47 @@ function setAppSetting(key, value) {
   return value;
 }
 
+function attendanceSettingKey(sessionId) {
+  const cleanSessionId = normalizeSessionId(sessionId);
+  return cleanSessionId ? `attendance_session:${cleanSessionId}` : "";
+}
+
+function getAttendanceSession(sessionId) {
+  const key = attendanceSettingKey(sessionId);
+  return key ? getAppSetting(key, null) : null;
+}
+
+function saveAttendanceSession(payload = {}, actor = "aikkie-bot") {
+  const sessionId = normalizeSessionId(payload.session_id || payload.sessionId);
+  if (!sessionId) {
+    const error = new Error("Atendimento invalido. Reinicie o atendimento pelo Aikkie Bot.");
+    error.status = 422;
+    throw error;
+  }
+  const previous = getAttendanceSession(sessionId) || { session_id: sessionId, created_at: now() };
+  const next = {
+    ...previous,
+    session_id: sessionId,
+    cnpj: String(payload.cnpj || previous.cnpj || "").trim(),
+    uf: normalizeUf(payload.uf || previous.uf || getCompany()?.uf || "SP"),
+    updated_at: now()
+  };
+  setAppSetting(attendanceSettingKey(sessionId), next);
+  logAudit("attendance_session", null, "save_company", actor, previous, next);
+  return next;
+}
+
+function getExportCompany(sessionId = "") {
+  const company = getCompany();
+  const attendance = getAttendanceSession(sessionId);
+  if (!attendance) return company;
+  return {
+    ...company,
+    cnpj: attendance.cnpj || company?.cnpj || "",
+    uf: attendance.uf || company?.uf || ""
+  };
+}
+
 function billingEnabled() {
   return AI_BILLING_DEFAULT_ENABLED;
 }
@@ -2184,10 +2236,11 @@ async function createMercadoPagoPixPayment({ description, amountCents, quantity,
   };
 }
 
-async function prepareAiBilling({ classificationId = null, quantity = 1, actor = "contador", context = "item" } = {}) {
+async function prepareAiBilling({ classificationId = null, quantity = 1, actor = "contador", context = "item", sessionId = "" } = {}) {
   const config = aiBillingConfig();
   const cleanQuantity = Math.max(1, Number(quantity || 1));
   const amountCents = AI_BILLING_PRICE_CENTS * cleanQuantity;
+  const cleanSessionId = normalizeSessionId(sessionId);
   if (!config.enabled) {
     return {
       enabled: false,
@@ -2198,7 +2251,7 @@ async function prepareAiBilling({ classificationId = null, quantity = 1, actor =
       message: "Pagamento do classificador obrigatorio."
     };
   }
-  assertAiProcessingUnlocked();
+  assertAiProcessingUnlocked(null, cleanSessionId);
 
   const insert = db.prepare(
     `
@@ -2211,7 +2264,7 @@ async function prepareAiBilling({ classificationId = null, quantity = 1, actor =
     classificationId,
     cleanQuantity,
     amountCents,
-    asJson({ actor, context, unit_price_cents: AI_BILLING_PRICE_CENTS }),
+    asJson({ actor, context, session_id: cleanSessionId || null, unit_price_cents: AI_BILLING_PRICE_CENTS }),
     now(),
     now()
   );
@@ -2221,7 +2274,7 @@ async function prepareAiBilling({ classificationId = null, quantity = 1, actor =
       description: "Conferencia e sugestao de NCM no Aikkie AutoClass Fiscal",
       amountCents,
       quantity: cleanQuantity,
-      metadata: { billing_event_id: eventId, classification_id: classificationId, actor, context }
+      metadata: { billing_event_id: eventId, classification_id: classificationId, actor, context, session_id: cleanSessionId || null }
     });
     db.prepare(
       `
@@ -2233,7 +2286,7 @@ async function prepareAiBilling({ classificationId = null, quantity = 1, actor =
       payment.status,
       payment.payment_id || payment.external_reference,
       payment.ticket_url,
-      asJson({ actor, context, unit_price_cents: AI_BILLING_PRICE_CENTS, payment }),
+      asJson({ actor, context, session_id: cleanSessionId || null, unit_price_cents: AI_BILLING_PRICE_CENTS, payment }),
       now(),
       eventId
     );
@@ -2427,6 +2480,7 @@ function publicBillingFromEvent(event, overrides = {}) {
     enabled: true,
     event_id: event?.id || overrides.event_id || null,
     context: metadata?.context || overrides.context || null,
+    session_id: metadata?.session_id || overrides.session_id || null,
     classification_id: event?.classification_id || overrides.classification_id || null,
     status: publicStatus,
     paid,
@@ -2467,19 +2521,21 @@ function isAiBillingProcessingEvent(event) {
   return Date.now() - startedAt < AI_BILLING_PROCESSING_LOCK_MS;
 }
 
-function getActiveAiProcessingEvent() {
+function getActiveAiProcessingEvent(sessionId = "") {
+  const cleanSessionId = normalizeSessionId(sessionId);
   const rows = db
-    .prepare("SELECT * FROM ai_billing_events WHERE status = 'processing_ai' ORDER BY updated_at DESC LIMIT 10")
+    .prepare("SELECT * FROM ai_billing_events WHERE status = 'processing_ai' ORDER BY updated_at DESC LIMIT 100")
     .all();
   for (const row of rows) {
     const event = rowToAiBillingEvent(row);
+    if (cleanSessionId && event?.metadata?.session_id !== cleanSessionId) continue;
     if (isAiBillingProcessingEvent(event)) return event;
   }
   return null;
 }
 
-function assertAiProcessingUnlocked(allowedEventId = null) {
-  const active = getActiveAiProcessingEvent();
+function assertAiProcessingUnlocked(allowedEventId = null, sessionId = "") {
+  const active = getActiveAiProcessingEvent(sessionId);
   if (!active || Number(active.id) === Number(allowedEventId || 0)) return;
   const error = new Error("A auto classificacao esta processando os produtos agora. Aguarde finalizar antes de alterar a tabela ou gerar outro pagamento.");
   error.status = 409;
@@ -2596,6 +2652,7 @@ function updateBillingEventWithPaymentPayload(event, paymentPayload = {}) {
 }
 
 async function resolveAiBillingForUse({ classificationId = null, quantity = 1, actor = "contador", context = "item", options = {} } = {}) {
+  const sessionId = normalizeSessionId(options.session_id || options.sessionId);
   if (!billingEnabled()) {
     return {
       enabled: false,
@@ -2622,6 +2679,11 @@ async function resolveAiBillingForUse({ classificationId = null, quantity = 1, a
       error.status = 409;
       throw error;
     }
+    if (sessionId && event.metadata?.session_id && event.metadata.session_id !== sessionId) {
+      const error = new Error("Esta cobrança pertence a outro atendimento.");
+      error.status = 409;
+      throw error;
+    }
     if (classificationId && event.classification_id && Number(event.classification_id) !== Number(classificationId)) {
       const error = new Error("Esta cobrança pertence a outro item.");
       error.status = 409;
@@ -2634,7 +2696,7 @@ async function resolveAiBillingForUse({ classificationId = null, quantity = 1, a
     return await refreshMercadoPagoBillingEvent(event);
   }
 
-  return await prepareAiBilling({ classificationId, quantity, actor, context });
+  return await prepareAiBilling({ classificationId, quantity, actor, context, sessionId });
 }
 
 function formatNcm(code) {
@@ -4384,7 +4446,18 @@ async function runWithConcurrency(items, concurrency, worker) {
 async function checkReviewTableAiNcm(options = {}, actor = "contador") {
   assertOpenAiConfigured();
   const limit = Math.min(Math.max(Number(options.limit || 100), 1), 500);
-  const rows = db.prepare("SELECT id FROM classifications WHERE status != 'approved' ORDER BY id LIMIT ?").all(limit);
+  const sessionId = normalizeSessionId(options.session_id || options.sessionId);
+  const rows = sessionId
+    ? db.prepare(`
+        SELECT c.id
+        FROM classifications c
+        JOIN products p ON p.id = c.product_id
+        JOIN import_batches ib ON ib.id = p.batch_id
+        WHERE c.status != 'approved' AND ib.session_id = ?
+        ORDER BY c.id
+        LIMIT ?
+      `).all(sessionId, limit)
+    : db.prepare("SELECT id FROM classifications WHERE status != 'approved' ORDER BY id LIMIT ?").all(limit);
   const aiJobs = [];
 
   for (const row of rows) {
@@ -4395,7 +4468,7 @@ async function checkReviewTableAiNcm(options = {}, actor = "contador") {
   }
 
   const billing = aiJobs.length
-    ? await resolveAiBillingForUse({ quantity: aiJobs.length, actor, context: "table", options })
+    ? await resolveAiBillingForUse({ quantity: aiJobs.length, actor, context: "table", options: { ...options, session_id: sessionId || undefined } })
     : {
         enabled: billingEnabled(),
         status: rows.length ? "no_billable_items" : "empty",
@@ -4414,7 +4487,7 @@ async function checkReviewTableAiNcm(options = {}, actor = "contador") {
       payment_required: true,
       openai: aiNcmConfig(),
       billing,
-      items: listClassifications({ limit: 500 })
+      items: listClassifications({ limit: 500, session_id: sessionId || undefined })
     };
   }
   const paidQuantity = billing?.enabled ? Math.max(0, Number(billing.quantity || 0)) : aiJobs.length;
@@ -4518,7 +4591,7 @@ async function checkReviewTableAiNcm(options = {}, actor = "contador") {
     unpaid_items: unpaidItems,
     base_error_items: 0,
     openai: aiNcmConfig(),
-    billing: billing?.event_id ? publicBillingFromEvent(getAiBillingEvent(billing.event_id)) : billing,
+    billing: billing?.event_id ? publicBillingFromEvent(getAiBillingEvent(billing.event_id), { session_id: sessionId || null }) : billing,
     items
   };
 }
@@ -4644,8 +4717,10 @@ async function processPaidAiBillingEvent(eventId, actor = "mercado_pago_webhook"
   try {
     const current = marker.event || event;
     const context = current.metadata?.context || "table";
+    const sessionId = normalizeSessionId(current.metadata?.session_id);
     const options = {
       billing_event_id: current.id,
+      session_id: sessionId || undefined,
       apply_suggestion: true,
       use_web: true,
       skip_payment_refresh: true,
@@ -4975,13 +5050,14 @@ function classifyProduct(product, operationType = "venda", uf = "") {
   };
 }
 
-function createImportBatch({ filename, sourceType, operationType, uf, importedBy, rowCount }) {
+function createImportBatch({ filename, sourceType, operationType, uf, importedBy, rowCount, sessionId }) {
   const operation = normalizeOperationType(operationType);
   const fiscalUf = normalizeUf(uf, getCompany()?.uf || "SP");
+  const cleanSessionId = normalizeSessionId(sessionId);
   const result = db.prepare(`
-    INSERT INTO import_batches (filename, source_type, operation_type, uf, imported_by, row_count, created_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?)
-  `).run(filename || null, sourceType, operation, fiscalUf, importedBy || "sistema", rowCount || 0, now());
+    INSERT INTO import_batches (session_id, filename, source_type, operation_type, uf, imported_by, row_count, created_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(cleanSessionId || null, filename || null, sourceType, operation, fiscalUf, importedBy || "sistema", rowCount || 0, now());
   return Number(result.lastInsertRowid);
 }
 
@@ -5059,7 +5135,7 @@ function insertProduct(batchId, product, operationType, uf = "") {
   return productId;
 }
 
-function importProducts({ products, filename, sourceType, operationType, uf, importedBy }) {
+function importProducts({ products, filename, sourceType, operationType, uf, importedBy, sessionId }) {
   const cleanProducts = products
     .map((product, index) => mapProductRow(product, index))
     .filter((product) => product.descricao_original);
@@ -5071,7 +5147,8 @@ function importProducts({ products, filename, sourceType, operationType, uf, imp
     operationType: operation,
     uf: fiscalUf,
     importedBy,
-    rowCount: cleanProducts.length
+    rowCount: cleanProducts.length,
+    sessionId
   });
   const ids = cleanProducts.map((product) => insertProduct(batchId, { ...product, uf: fiscalUf }, operation, fiscalUf));
   logAudit("import_batch", batchId, "import", importedBy || "sistema", null, {
@@ -5079,9 +5156,10 @@ function importProducts({ products, filename, sourceType, operationType, uf, imp
     sourceType,
     operationType: operation,
     uf: fiscalUf,
-    rowCount: cleanProducts.length
+    rowCount: cleanProducts.length,
+    sessionId: normalizeSessionId(sessionId) || null
   });
-  return { batchId, imported: ids.length, operationType: operation, uf: fiscalUf };
+  return { batchId, imported: ids.length, operationType: operation, uf: fiscalUf, session_id: normalizeSessionId(sessionId) || null };
 }
 
 function rowToClassification(row) {
@@ -5089,6 +5167,7 @@ function rowToClassification(row) {
     id: row.classification_id,
     product_id: row.product_id,
     batch_id: row.batch_id,
+    session_id: row.session_id || row.batch_session_id || null,
     operation_type: normalizeOperationType(row.operation_type || row.batch_operation_type || "venda"),
     uf: normalizeUf(row.uf || row.batch_uf || getCompany()?.uf, "SP"),
     codigo_produto: row.codigo_produto,
@@ -5142,6 +5221,11 @@ function rowToClassification(row) {
 function listClassifications(params = {}) {
   const where = [];
   const values = [];
+  const sessionId = normalizeSessionId(params.session_id || params.sessionId);
+  if (sessionId) {
+    where.push("ib.session_id = ?");
+    values.push(sessionId);
+  }
   if (params.status && params.status !== "all") {
     where.push("c.status = ?");
     values.push(params.status);
@@ -5158,7 +5242,8 @@ function listClassifications(params = {}) {
       p.descricao_tratada, p.unidade, p.preco, p.codigo_barras, p.peso,
       p.marca, p.categoria, p.ncm_importado, p.created_at,
       ib.operation_type AS batch_operation_type,
-      ib.uf AS batch_uf
+      ib.uf AS batch_uf,
+      ib.session_id AS batch_session_id
     FROM classifications c
     JOIN products p ON p.id = c.product_id
     LEFT JOIN import_batches ib ON ib.id = p.batch_id
@@ -5180,7 +5265,8 @@ function getClassification(id) {
       p.descricao_tratada, p.unidade, p.preco, p.codigo_barras, p.peso,
       p.marca, p.categoria, p.ncm_importado, p.created_at,
       ib.operation_type AS batch_operation_type,
-      ib.uf AS batch_uf
+      ib.uf AS batch_uf,
+      ib.session_id AS batch_session_id
     FROM classifications c
     JOIN products p ON p.id = c.product_id
     LEFT JOIN import_batches ib ON ib.id = p.batch_id
@@ -5339,7 +5425,40 @@ function getDashboard() {
   };
 }
 
-function clearReviewTable(actor = "contador") {
+function clearReviewTable(actor = "contador", sessionId = "") {
+  const cleanSessionId = normalizeSessionId(sessionId);
+  if (cleanSessionId) {
+    const previous = db.prepare(`
+      SELECT
+        (SELECT COUNT(*)
+         FROM classifications c
+         JOIN products p ON p.id = c.product_id
+         JOIN import_batches ib ON ib.id = p.batch_id
+         WHERE ib.session_id = ?) AS classifications,
+        (SELECT COUNT(*)
+         FROM products p
+         JOIN import_batches ib ON ib.id = p.batch_id
+         WHERE ib.session_id = ?) AS products,
+        (SELECT COUNT(*) FROM import_batches WHERE session_id = ?) AS import_batches
+    `).get(cleanSessionId, cleanSessionId, cleanSessionId);
+
+    db.prepare(`
+      DELETE FROM classifications
+      WHERE product_id IN (
+        SELECT p.id
+        FROM products p
+        JOIN import_batches ib ON ib.id = p.batch_id
+        WHERE ib.session_id = ?
+      )
+    `).run(cleanSessionId);
+    db.prepare("DELETE FROM products WHERE batch_id IN (SELECT id FROM import_batches WHERE session_id = ?)").run(cleanSessionId);
+    db.prepare("DELETE FROM import_batches WHERE session_id = ?").run(cleanSessionId);
+
+    const next = { classifications: 0, products: 0, import_batches: 0 };
+    logAudit("review_table", null, "clear_session", actor, previous, { ...next, session_id: cleanSessionId });
+    return { cleared: true, session_id: cleanSessionId, previous, next };
+  }
+
   const previous = db
     .prepare(
       `
@@ -5361,6 +5480,29 @@ function clearReviewTable(actor = "contador") {
   const next = { classifications: 0, products: 0, import_batches: 0 };
   logAudit("review_table", null, "clear", actor, previous, next);
   return { cleared: true, previous, next };
+}
+
+function startAttendanceSession({ previousSessionId = "", actor = "aikkie-bot" } = {}) {
+  const previousSession = normalizeSessionId(previousSessionId);
+  const active = previousSession ? getActiveAiProcessingEvent(previousSession) : null;
+  if (active) {
+    return {
+      session_id: previousSession,
+      reused: true,
+      active_billing: publicBillingFromEvent(active),
+      cleared: null,
+      message: "Atendimento anterior esta processando. Mantive a sessao para nao apagar a fila em andamento."
+    };
+  }
+
+  const cleared = previousSession ? clearReviewTable(`${actor}_novo_atendimento`, previousSession) : null;
+  const sessionId = createAttendanceSessionId();
+  const session = saveAttendanceSession({ session_id: sessionId }, actor);
+  logAudit("attendance_session", null, "start", actor, previousSession ? { session_id: previousSession } : null, {
+    session_id: sessionId,
+    cleared_previous: cleared?.previous || null
+  });
+  return { session_id: sessionId, reused: false, cleared, session };
 }
 
 function clearTrainingRules(actor = "contador", onlyInvalid = false) {
@@ -5461,8 +5603,8 @@ function buildExportCompanyRows(company = getCompany()) {
   ];
 }
 
-function buildExportRows() {
-  return listClassifications({ limit: 1000 }).map((item) => ({
+function buildExportRows(sessionId = "") {
+  return listClassifications({ limit: 1000, session_id: sessionId }).map((item) => ({
     Produto: cleanExportProductName(item),
     SKU: item.sku || item.codigo_produto || "",
     EAN: item.ean || item.codigo_barras || "",
@@ -5497,11 +5639,11 @@ function buildExportRows() {
   }));
 }
 
-function buildCsvExport() {
-  const rows = buildExportRows();
+function buildCsvExport(sessionId = "") {
+  const rows = buildExportRows(sessionId);
   const headers = EXPORT_PRODUCT_HEADERS;
   return [
-    ...buildExportCompanyRows().map((row) => row.map(escapeCsv).join(";")),
+    ...buildExportCompanyRows(getExportCompany(sessionId)).map((row) => row.map(escapeCsv).join(";")),
     "",
     headers.map(escapeCsv).join(";"),
     ...rows.map((row) => headers.map((header) => escapeCsv(row[header])).join(";"))
@@ -5583,7 +5725,7 @@ function buildZipBuffer(files = []) {
   return Buffer.concat([...localChunks, centralDirectory, eocd]);
 }
 
-async function buildXlsxExport() {
+async function buildXlsxExport(sessionId = "") {
   let XLSX;
   try {
     XLSX = await import("xlsx");
@@ -5592,8 +5734,8 @@ async function buildXlsxExport() {
     error.status = 422;
     throw error;
   }
-  const company = getCompany();
-  const rows = buildExportRows();
+  const company = getExportCompany(sessionId);
+  const rows = buildExportRows(sessionId);
   const companyRows = buildExportCompanyRows(company);
   const worksheetRows = [
     ...companyRows,
@@ -5729,6 +5871,24 @@ async function handleRequest(req, res) {
     return sendJson(res, 200, getDashboard());
   }
 
+  if (req.method === "POST" && path === "/api/attendance/start") {
+    const payload = JSON.parse(decodeText(await readBody(req)) || "{}");
+    return sendJson(
+      res,
+      201,
+      startAttendanceSession({
+        previousSessionId: payload.previous_session_id || payload.previousSessionId || "",
+        actor: payload.actor || "aikkie-bot"
+      })
+    );
+  }
+
+  if (req.method === "PUT" && path === "/api/attendance/company") {
+    const payload = JSON.parse(decodeText(await readBody(req)) || "{}");
+    assertAiProcessingUnlocked(null, payload.session_id || payload.sessionId || "");
+    return sendJson(res, 200, saveAttendanceSession(payload, payload.actor || "aikkie-bot"));
+  }
+
   if (req.method === "GET" && path === "/api/company") {
     return sendJson(res, 200, getCompany());
   }
@@ -5825,7 +5985,8 @@ async function handleRequest(req, res) {
       items: listClassifications({
         status: url.searchParams.get("status") || "all",
         q: url.searchParams.get("q") || "",
-        limit: url.searchParams.get("limit") || 250
+        limit: url.searchParams.get("limit") || 250,
+        session_id: url.searchParams.get("session_id") || ""
       })
     });
   }
@@ -5839,7 +6000,7 @@ async function handleRequest(req, res) {
 
   if (req.method === "POST" && path === "/api/classifications/ai-ncm") {
     const payload = JSON.parse(decodeText(await readBody(req)) || "{}");
-    assertAiProcessingUnlocked(payload.billing_event_id || payload.billingEventId);
+    assertAiProcessingUnlocked(payload.billing_event_id || payload.billingEventId, payload.session_id || payload.sessionId || "");
     return sendJson(res, 200, await checkReviewTableAiNcm(payload, payload.actor || "contador"));
   }
 
@@ -5869,7 +6030,7 @@ async function handleRequest(req, res) {
   const aiNcmMatch = path.match(/^\/api\/classifications\/(\d+)\/ai-ncm$/);
   if (aiNcmMatch && req.method === "POST") {
     const payload = JSON.parse(decodeText(await readBody(req)) || "{}");
-    assertAiProcessingUnlocked(payload.billing_event_id || payload.billingEventId);
+    assertAiProcessingUnlocked(payload.billing_event_id || payload.billingEventId, payload.session_id || payload.sessionId || "");
     const updated = await checkClassificationAiNcm(Number(aiNcmMatch[1]), payload, payload.actor || "contador");
     if (!updated) return sendJson(res, 404, { error: "Classificacao nao encontrada." });
     return sendJson(res, 200, updated);
@@ -5886,24 +6047,25 @@ async function handleRequest(req, res) {
 
   if (req.method === "POST" && path === "/api/products/manual") {
     const payload = JSON.parse(decodeText(await readBody(req)) || "{}");
-    assertAiProcessingUnlocked();
+    assertAiProcessingUnlocked(null, payload.session_id || payload.sessionId || "");
     const result = importProducts({
       products: [payload],
       filename: "cadastro-manual",
       sourceType: "manual",
       operationType: payload.operation_type || "venda",
       uf: payload.uf || getCompany()?.uf || "SP",
-      importedBy: payload.actor || "contador"
+      importedBy: payload.actor || "contador",
+      sessionId: payload.session_id || payload.sessionId || ""
     });
     return sendJson(res, 201, result);
   }
 
   if (req.method === "POST" && path === "/api/imports") {
-    assertAiProcessingUnlocked();
     const contentType = req.headers["content-type"] || "";
     const body = await readBody(req);
     if (contentType.includes("multipart/form-data")) {
       const form = parseMultipart(body, contentType);
+      assertAiProcessingUnlocked(null, form.fields.session_id || form.fields.sessionId || "");
       const file = form.files[0];
       if (!file) return sendJson(res, 422, { error: "Envie um arquivo para importar." });
       const products = await parseProductsFromFile(file.filename, file.buffer);
@@ -5913,12 +6075,14 @@ async function handleRequest(req, res) {
         sourceType: extname(file.filename).replace(".", "") || "arquivo",
         operationType: form.fields.operation_type || "venda",
         uf: form.fields.uf || getCompany()?.uf || "SP",
-        importedBy: form.fields.imported_by || "contador"
+        importedBy: form.fields.imported_by || "contador",
+        sessionId: form.fields.session_id || form.fields.sessionId || ""
       });
       return sendJson(res, 201, result);
     }
 
     const payload = JSON.parse(decodeText(body) || "{}");
+    assertAiProcessingUnlocked(null, payload.session_id || payload.sessionId || "");
     if (!Array.isArray(payload.products)) return sendJson(res, 422, { error: "Informe products como lista." });
     const result = importProducts({
       products: payload.products,
@@ -5926,7 +6090,8 @@ async function handleRequest(req, res) {
       sourceType: payload.source_type || "json",
       operationType: payload.operation_type || "venda",
       uf: payload.uf || getCompany()?.uf || "SP",
-      importedBy: payload.imported_by || "contador"
+      importedBy: payload.imported_by || "contador",
+      sessionId: payload.session_id || payload.sessionId || ""
     });
     return sendJson(res, 201, result);
   }
@@ -5941,17 +6106,19 @@ async function handleRequest(req, res) {
   }
 
   if (req.method === "GET" && path === "/api/export/classifications.csv") {
-    assertAiProcessingUnlocked();
-    const csv = buildCsvExport();
+    const sessionId = normalizeSessionId(url.searchParams.get("session_id") || "");
+    assertAiProcessingUnlocked(null, sessionId);
+    const csv = buildCsvExport(sessionId);
     const filename = exportFilename("csv");
     sendText(res, 200, csv, "text/csv; charset=utf-8", filename);
-    clearReviewTable("exportacao_csv");
+    clearReviewTable("exportacao_csv", sessionId);
     return;
   }
 
   if (req.method === "GET" && path === "/api/export/classifications.xlsx") {
-    assertAiProcessingUnlocked();
-    const buffer = await buildXlsxExport();
+    const sessionId = normalizeSessionId(url.searchParams.get("session_id") || "");
+    assertAiProcessingUnlocked(null, sessionId);
+    const buffer = await buildXlsxExport(sessionId);
     return sendBuffer(
       res,
       200,
@@ -5962,11 +6129,14 @@ async function handleRequest(req, res) {
   }
 
   if (req.method === "GET" && path === "/api/export/classifications.zip") {
-    assertAiProcessingUnlocked();
-    const xlsxBuffer = await buildXlsxExport();
+    const sessionId = normalizeSessionId(url.searchParams.get("session_id") || "");
+    assertAiProcessingUnlocked(null, sessionId);
+    const xlsxBuffer = await buildXlsxExport(sessionId);
     const xlsxName = exportFilename("xlsx");
     const zipBuffer = buildZipBuffer([{ name: xlsxName, data: xlsxBuffer }]);
-    return sendBuffer(res, 200, zipBuffer, "application/zip", exportFilename("zip"));
+    sendBuffer(res, 200, zipBuffer, "application/zip", exportFilename("zip"));
+    clearReviewTable("exportacao_zip", sessionId);
+    return;
   }
 
   if (req.method === "GET" && !path.startsWith("/api/") && tryServeFront(url, res)) {
